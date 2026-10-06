@@ -9,8 +9,16 @@
 //! the ones it had decoded but not yet returned, so the output is the software decoder's own
 //! sequence. That replay log is bounded; past the bound a failure is reported as an error once
 //! and the instance continues in software from the next seek ([`VideoDecoder::reset`]).
+//!
+//! A hardware path that has not been checked on real hardware yet can be verified on first use
+//! ([`HybridDecoder::verifying`]): the first decoder of that path in the process runs our
+//! reference decoder in lockstep and compares every picture of the first calls bit for bit. On a
+//! match the path is trusted for the rest of the run; on a mismatch the instance continues with the
+//! (already synchronised) reference decoder and the path is turned off for the rest of the run, so
+//! a wrong hardware picture never reaches the caller.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use filmcraft_codecs::hw::NalStreamInfo;
 use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
@@ -21,6 +29,94 @@ const LOG_MAX_SAMPLES: usize = 600;
 const LOG_MAX_BYTES: usize = 256 << 20;
 /// Presentation times remembered as returned (older ones are forgotten first).
 const EMITTED_MAX: usize = 4096;
+/// Pictures compared before a hardware path counts as verified.
+const VERIFY_PICTURES: usize = 8;
+
+/// Where a hardware path's first-use verification stands ([`verification`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verification {
+    /// Verified in this process: use it.
+    Verified,
+    /// Not verified yet and now claimed by the caller, who verifies it
+    /// ([`HybridDecoder::verifying`]) or gives the claim back ([`release`]).
+    Claimed,
+    /// Another decoder is verifying it right now: use the software decoder meanwhile.
+    Busy,
+    /// Its pictures differed from ours: off for the rest of the run.
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Verifying,
+    Verified,
+    Failed,
+}
+
+fn states() -> std::sync::MutexGuard<'static, HashMap<&'static str, State>> {
+    static S: OnceLock<Mutex<HashMap<&'static str, State>>> = OnceLock::new();
+    S.get_or_init(Default::default).lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The state of hardware path `key`; an unverified path is claimed by the caller.
+pub fn verification(key: &'static str) -> Verification {
+    let mut m = states();
+    match m.get(key) {
+        Some(State::Verified) => Verification::Verified,
+        Some(State::Failed) => Verification::Failed,
+        Some(State::Verifying) => Verification::Busy,
+        None => {
+            m.insert(key, State::Verifying);
+            Verification::Claimed
+        }
+    }
+}
+
+/// Give back a claim without a verdict (the stream could not be checked); a later decoder verifies.
+pub fn release(key: &'static str) {
+    let mut m = states();
+    if m.get(key) == Some(&State::Verifying) {
+        m.remove(key);
+    }
+}
+
+fn settle(key: &'static str, ok: bool) {
+    states().insert(key, if ok { State::Verified } else { State::Failed });
+}
+
+/// Forget every verdict (tests).
+pub fn reset_verification() {
+    states().clear();
+}
+
+/// A first-use check in progress: the reference decoder in lockstep with the hardware.
+struct Verify {
+    key: &'static str,
+    reference: Box<dyn VideoDecoder>,
+    /// Pictures still to compare.
+    left: usize,
+}
+
+/// Bit-exact equality of two decoders' outputs (pictures, order, pts, colour, aspect).
+fn same_frames(a: &[DecodedFrame], b: &[DecodedFrame]) -> bool {
+    use filmcraft_codecs::DecodedFrame as F;
+    fn same(x: &F, y: &F) -> bool {
+        let (p, q) = (&x.frame, &y.frame);
+        let pixels = match (&p.data, &q.data) {
+            (filmcraft_frame::PixelData::Yuv8 { planes: a, chroma: c, alpha: al }, filmcraft_frame::PixelData::Yuv8 { planes: b, chroma: d, alpha: bl }) => {
+                c == d && al == bl && a.iter().zip(b).all(|(a, b)| a == b)
+            }
+            (
+                filmcraft_frame::PixelData::Yuv16 { planes: a, chroma: c, bits: n, alpha: al },
+                filmcraft_frame::PixelData::Yuv16 { planes: b, chroma: d, bits: m, alpha: bl },
+            ) => c == d && n == m && al == bl && a.iter().zip(b).all(|(a, b)| a == b),
+            (filmcraft_frame::PixelData::Rgba8(a), filmcraft_frame::PixelData::Rgba8(b)) => a == b,
+            _ => false,
+        };
+        x.pts == y.pts && x.draft == y.draft && p.width == q.width && p.height == q.height && p.color == q.color && p.par == q.par && pixels
+    }
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same(x, y))
+}
 
 /// A hardware decoder with a transparent software fallback.
 pub struct HybridDecoder {
@@ -38,6 +134,8 @@ pub struct HybridDecoder {
     emitted: BTreeSet<i64>,
     /// Pictures the hardware had decoded but not returned when it failed.
     carry: BTreeMap<i64, DecodedFrame>,
+    /// First-use verification in progress.
+    verify: Option<Verify>,
 }
 
 impl HybridDecoder {
@@ -55,6 +153,78 @@ impl HybridDecoder {
             last_irap: 0,
             emitted: BTreeSet::new(),
             carry: BTreeMap::new(),
+            verify: None,
+        }
+    }
+
+    /// As [`HybridDecoder::new`], checking the hardware against our reference decoder
+    /// (`filmcraft_codecs::reference_video_decoder`) on the first pictures, for the caller that
+    /// claimed path `key` ([`verification`]). On an error the claim is given back.
+    pub fn verifying(hw: Box<dyn VideoDecoder>, entry: SampleEntry, info: NalStreamInfo, key: &'static str) -> Result<Self> {
+        let reference = match filmcraft_codecs::reference_video_decoder(&entry) {
+            Ok(d) => d,
+            Err(e) => {
+                release(key);
+                return Err(e);
+            }
+        };
+        let mut h = Self::new(hw, entry, info);
+        h.verify = Some(Verify { key, reference, left: VERIFY_PICTURES });
+        Ok(h)
+    }
+
+    /// Whether a first-use check is still running.
+    pub fn is_verifying(&self) -> bool {
+        self.verify.is_some()
+    }
+
+    /// Continue with `sw` (in step with the stream) instead of the hardware.
+    fn switch_to(&mut self, mut sw: Box<dyn VideoDecoder>) {
+        sw.set_draft(self.draft);
+        self.hw = None;
+        self.sw = Some(sw);
+    }
+
+    /// Settle one lockstep step of the first-use check (`hw` / `sw`: both decoders' results for
+    /// the same call).
+    fn checked(&mut self, hw: Result<Vec<DecodedFrame>>, sw: Result<Vec<DecodedFrame>>) -> Result<Vec<DecodedFrame>> {
+        let Some(v) = self.verify.take() else { return hw };
+        match (hw, sw) {
+            (Ok(h), Ok(s)) if same_frames(&h, &s) => {
+                filmcraft_codecs::hw::note_hw_frames(h.len());
+                let left = v.left.saturating_sub(h.len());
+                if left == 0 {
+                    settle(v.key, true);
+                    log::info!("{}: pictures match the software decoder; using the hardware", v.key);
+                } else {
+                    self.verify = Some(Verify { left, ..v });
+                }
+                self.note_emitted(&h);
+                Ok(h)
+            }
+            (Ok(_), Ok(s)) => {
+                log::error!("{}: pictures differ from the software decoder's; hardware decoding of this kind is off for the rest of the run", v.key);
+                settle(v.key, false);
+                filmcraft_codecs::hw::note_hw_mismatch();
+                self.switch_to(v.reference);
+                self.note_emitted(&s);
+                Ok(s)
+            }
+            (Err(e), Ok(s)) => {
+                log::warn!("{}: failed while being checked ({e}); continuing with the software decoder", v.key);
+                release(v.key);
+                filmcraft_codecs::hw::note_hw_fallback();
+                self.switch_to(v.reference);
+                self.note_emitted(&s);
+                Ok(s)
+            }
+            (_, Err(e)) => {
+                // A stream our own decoder rejects cannot be checked: give the claim back and
+                // behave as the software decoder does.
+                release(v.key);
+                self.switch_to(v.reference);
+                Err(e)
+            }
         }
     }
 
@@ -168,7 +338,21 @@ impl VideoDecoder for HybridDecoder {
         }
         self.remember(sample, pts);
         if self.parameter_sets_changed(sample) {
+            if let Some(v) = self.verify.take() {
+                // The reference decoder of the check is in step with the stream: continue with it.
+                log::warn!("{}: in-band parameter sets differ from the sample entry; continuing with the software decoder", v.key);
+                release(v.key);
+                filmcraft_codecs::hw::note_hw_fallback();
+                self.switch_to(v.reference);
+                let frames = self.sw.as_mut().map(|sw| sw.decode(sample, pts)).unwrap_or_else(|| Ok(Vec::new()))?;
+                return Ok(self.merge(frames));
+            }
             return self.fall_back(CodecError::Decode("in-band parameter sets differ from the sample entry".into()));
+        }
+        if let (Some(v), Some(hw)) = (self.verify.as_mut(), self.hw.as_mut()) {
+            let s = v.reference.decode(sample, pts);
+            let h = hw.decode(sample, pts);
+            return self.checked(h, s);
         }
         let Some(hw) = self.hw.as_mut() else {
             return Err(CodecError::Decode("no decoder".into()));
@@ -184,6 +368,11 @@ impl VideoDecoder for HybridDecoder {
     }
 
     fn flush(&mut self) -> Vec<DecodedFrame> {
+        if let (Some(v), Some(hw)) = (self.verify.as_mut(), self.hw.as_mut()) {
+            let s = v.reference.flush();
+            let h = hw.flush();
+            return self.checked(Ok(h), Ok(s)).unwrap_or_default();
+        }
         if let Some(hw) = self.hw.as_mut() {
             let out = hw.flush();
             filmcraft_codecs::hw::note_hw_frames(out.len());
@@ -199,6 +388,9 @@ impl VideoDecoder for HybridDecoder {
     fn reset(&mut self) {
         if let Some(hw) = self.hw.as_mut() {
             hw.reset();
+        }
+        if let Some(v) = self.verify.as_mut() {
+            v.reference.reset();
         }
         if let Some(sw) = self.sw.as_mut() {
             sw.reset();
@@ -227,9 +419,19 @@ impl VideoDecoder for HybridDecoder {
     }
 
     fn set_draft(&mut self, on: bool) {
+        // The reference decoder of a first-use check stays exact (the hardware ignores draft mode).
         self.draft = on;
         if let Some(sw) = self.sw.as_mut() {
             sw.set_draft(on);
+        }
+    }
+}
+
+impl Drop for HybridDecoder {
+    fn drop(&mut self) {
+        // An unfinished check gives its claim back, so a later decoder verifies the path.
+        if let Some(v) = self.verify.take() {
+            release(v.key);
         }
     }
 }

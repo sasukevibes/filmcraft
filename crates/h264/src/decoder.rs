@@ -6,7 +6,8 @@
 //! jobs of later pictures block per row on the reference data they need, so several pictures decode
 //! concurrently (frame-level parallelism).
 
-use crate::dpb::{Dpb, Output, OutputMeta};
+use crate::accel;
+use crate::dpb::{Dpb, DpbEntry, Output, OutputMeta, RefMark};
 use crate::error::{Error, Result, ensure, invalid, unsupported};
 use crate::params::{Pps, Sps};
 use crate::picture::{Frame, FrameRef, MbKind, MbState, Planes, RefPic};
@@ -37,6 +38,10 @@ struct PendingPic {
     pts: i64,
     key: bool,
     slices: Vec<SliceJob>,
+    /// Front-end mode: the slice NAL units as received.
+    nals: Vec<Vec<u8>>,
+    /// Every slice so far is an I or SI slice.
+    intra: bool,
 }
 
 /// Counters describing what the decoder has seen (useful to check test coverage).
@@ -98,6 +103,9 @@ pub struct Decoder {
     threads: usize,
     /// Draft mode: skip deblocking of non-reference pictures ([`Decoder::set_draft`]).
     draft: bool,
+    /// Hardware front-end mode ([`crate::accel::Frontend`]): pictures are reported as events
+    /// instead of being decoded, and outputs go here instead of `out_queue`.
+    accel: Option<Vec<accel::Event>>,
 }
 
 impl Default for Decoder {
@@ -178,7 +186,43 @@ impl Decoder {
             max_in_flight: threads.max(1) + 2,
             threads: workers,
             draft: false,
+            accel: None,
         }
+    }
+
+    /// A decoder in hardware front-end mode ([`crate::accel::Frontend`]): no worker threads, no
+    /// pixel decoding.
+    pub(crate) fn accel() -> Self {
+        let mut d = Self::with_threads(1);
+        d.accel = Some(Vec::new());
+        d
+    }
+
+    /// Front-end mode: one access unit, as [`Decoder::decode`], reported as events.
+    pub(crate) fn decode_accel(&mut self, data: &[u8], pts: i64) -> Result<Vec<accel::Event>> {
+        let nals = match self.nal_length_size {
+            Some(n) => length_prefixed_nals(data, n)?,
+            None => annexb_nals(data),
+        };
+        let mut result = Ok(());
+        for nal in nals {
+            if let Err(e) = self.handle_nal(nal, pts) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.submit_pending();
+        let events = self.accel.as_mut().map(std::mem::take).unwrap_or_default();
+        result.map(|()| events)
+    }
+
+    /// Front-end mode: end of stream, as [`Decoder::flush`].
+    pub(crate) fn flush_accel(&mut self) -> Vec<accel::Event> {
+        self.submit_pending();
+        let mut outs = Vec::new();
+        self.dpb.flush(&mut outs);
+        self.emit(outs);
+        self.accel.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Worker threads decoding pictures (1: on the calling thread).
@@ -381,6 +425,7 @@ impl Decoder {
             self.start_picture(&sh, &sps, pts)?;
         }
         let ls = self.level_scale(&pps);
+        let accel = self.accel.is_some();
         let Some(pending) = self.pending.as_mut() else {
             return invalid("slice without a started picture");
         };
@@ -399,6 +444,10 @@ impl Decoder {
             sh.mmcos.len() as u64,
             sh.long_term_reference as u64 + sh.mmcos.iter().filter(|m| m.op == 3 || m.op == 6).count() as u64,
         );
+        pending.intra &= st.is_intra();
+        if accel {
+            pending.nals.push(nal.to_vec());
+        }
         pending.slices.push(SliceJob { sh, pps, sps, rbsp, refs, ls });
         self.stat(|s| {
             if cabac {
@@ -449,10 +498,15 @@ impl Decoder {
                 let meta = Arc::new(output_meta(sps, pts, false));
                 let next_id = &mut self.next_id;
                 let poc_state = &mut self.poc_state;
+                let accel = self.accel.is_some();
                 let last = self.dpb.entries.iter().filter(|e| !e.non_existing).max_by_key(|e| e.frame.id).map(|e| e.frame.clone());
                 let mut make = |_fnum: u32| {
                     let id = *next_id;
                     *next_id += 1;
+                    if accel {
+                        // No samples in front-end mode: an empty frame stands for it (never read).
+                        return (Arc::new(Frame::new(id, 0, mb_w, mb_h)), meta.clone());
+                    }
                     let planes = match &last {
                         Some(f) if f.mb_w == mb_w && f.mb_h() == mb_h => {
                             let mut p = Planes::new(mb_w * 16, mb_h * 16);
@@ -478,24 +532,54 @@ impl Decoder {
         let id = self.next_id;
         self.next_id += 1;
         let frame = Arc::new(Frame::new(id, frame_poc, mb_w, mb_h));
-        self.pending = Some(PendingPic { frame, sps: sps.clone(), first: sh.clone(), poc, pts, key: sh.idr, slices: Vec::new() });
+        self.pending =
+            Some(PendingPic { frame, sps: sps.clone(), first: sh.clone(), poc, pts, key: sh.idr, slices: Vec::new(), nals: Vec::new(), intra: true });
         Ok(())
     }
 
     /// Start decoding the pending picture and do its reference marking / DPB insertion.
     fn submit_pending(&mut self) {
         let Some(p) = self.pending.take() else { return };
-        let PendingPic { frame, sps, first, poc, pts, key, slices } = p;
+        let PendingPic { frame, sps, first, poc, pts, key, slices, nals, intra } = p;
         let draft = self.draft && first.nal_ref_idc == 0;
-        self.dispatch(frame.clone(), slices, draft);
+        // Front-end mode: the picture's parameters, with the DPB as it is before its own
+        // reference marking. A picture without a slice (a broken stream) is not reported; its
+        // output then names a picture that was never decoded, which the hardware decoder rejects.
+        let accel_pic = match self.accel {
+            Some(_) => slices.first().map(|s| accel::DecodePicture {
+                id: frame.id,
+                sps: sps.clone(),
+                pps: s.pps.clone(),
+                frame_num: first.frame_num,
+                idr: first.idr,
+                idr_pic_id: first.idr_pic_id,
+                reference: first.nal_ref_idc != 0,
+                intra,
+                poc: (poc.top, poc.bottom),
+                stored: None,
+                slices: nals,
+                refs: self.dpb.entries.iter().filter(|e| e.mark != RefMark::Unused).map(accel_reference).collect(),
+                dpb: self.dpb.entries.iter().map(|e| e.frame.id).collect(),
+            }),
+            None => {
+                self.dispatch(frame.clone(), slices, draft);
+                None
+            }
+        };
         self.poc_state.update(&first, &poc);
         if first.nal_ref_idc != 0 {
             self.prev_ref_frame_num = if first.has_mmco5() { 0 } else { first.frame_num };
         }
         let meta = Arc::new(OutputMeta { draft, ..output_meta(&sps, pts, key) });
         let mut outs = Vec::new();
-        let fpoc = frame.poc;
-        self.dpb.store_picture(&first, frame, fpoc, sps.max_frame_num(), sps.max_num_ref_frames as usize, meta, &mut outs);
+        let (fpoc, id) = (frame.poc, frame.id);
+        // After an MMCO 5 the picture's order counts become relative to itself (8.2.1).
+        let field_poc = if first.has_mmco5() { (poc.top.saturating_sub(poc.frame()), poc.bottom.saturating_sub(poc.frame())) } else { (poc.top, poc.bottom) };
+        self.dpb.store_picture(&first, frame, fpoc, field_poc, sps.max_frame_num(), sps.max_num_ref_frames as usize, meta, &mut outs);
+        if let (Some(events), Some(mut pic)) = (self.accel.as_mut(), accel_pic) {
+            pic.stored = self.dpb.entries.iter().find(|e| e.frame.id == id && e.mark != RefMark::Unused).map(accel_reference);
+            events.push(accel::Event::Decode(pic));
+        }
         self.emit(outs);
     }
 
@@ -517,7 +601,40 @@ impl Decoder {
     }
 
     fn emit(&mut self, outs: Vec<Output>) {
-        self.out_queue.extend(outs);
+        match self.accel.as_mut() {
+            Some(events) => events.extend(outs.iter().map(|o| accel::Event::Output(accel_output(o)))),
+            None => self.out_queue.extend(outs),
+        }
+    }
+}
+
+/// A DPB entry as the front-end reports it.
+fn accel_reference(e: &DpbEntry) -> accel::Reference {
+    let long_term = e.mark == RefMark::Long;
+    accel::Reference {
+        id: e.frame.id,
+        long_term,
+        frame_num: if long_term { e.long_term_frame_idx } else { e.frame_num },
+        poc: e.field_poc,
+        non_existing: e.non_existing,
+    }
+}
+
+/// An output as the front-end reports it (the fields [`make_picture`] copies).
+fn accel_output(o: &Output) -> accel::OutputPicture {
+    accel::OutputPicture {
+        id: o.frame.id,
+        pts: o.meta.pts,
+        poc: o.poc,
+        key: o.meta.key,
+        crop: o.meta.crop,
+        color: ColorInfo {
+            full_range: o.meta.full_range,
+            primaries: o.meta.colour_primaries,
+            transfer: o.meta.transfer_characteristics,
+            matrix: o.meta.matrix_coefficients,
+        },
+        sar: o.meta.sar,
     }
 }
 

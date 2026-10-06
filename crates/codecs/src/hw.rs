@@ -42,12 +42,16 @@ pub struct HwStats {
     pub declined: u64,
     /// Hardware decoders that failed mid-stream and continued in software.
     pub fallbacks: u64,
+    /// Hardware decoders whose pictures differed from the software decoder's while being checked
+    /// on first use (that hardware path is then off for the rest of the run).
+    pub mismatches: u64,
 }
 
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static SESSIONS: AtomicU64 = AtomicU64::new(0);
 static DECLINED: AtomicU64 = AtomicU64::new(0);
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static MISMATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// The counters so far.
 pub fn hw_stats() -> HwStats {
@@ -56,6 +60,7 @@ pub fn hw_stats() -> HwStats {
         sessions: SESSIONS.load(Ordering::Relaxed),
         declined: DECLINED.load(Ordering::Relaxed),
         fallbacks: FALLBACKS.load(Ordering::Relaxed),
+        mismatches: MISMATCHES.load(Ordering::Relaxed),
     }
 }
 
@@ -77,6 +82,11 @@ pub fn note_hw_declined() {
 /// A hardware decoder switched to software mid-stream.
 pub fn note_hw_fallback() {
     FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A hardware decoder's pictures differed from the software decoder's.
+pub fn note_hw_mismatch() {
+    MISMATCHES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The two codecs whose `avcC` / `hvcC` streams hardware decoders take.

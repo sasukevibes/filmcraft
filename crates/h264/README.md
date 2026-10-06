@@ -58,6 +58,40 @@ if let Some(err) = dec.take_error() { /* error reported by a decoding thread */ 
 entire Annex-B file — also works). `Decoder::stats()` returns counters of the coding tools seen
 (macroblock types, slice types, MMCOs, long-term marks, frame_num gaps, ...).
 
+### Hardware front-end (`accel`)
+
+Stateless hardware decoding APIs (Vulkan Video, VA-API, D3D11 video) reconstruct pixels from what
+the application derives from the bitstream. `accel::Frontend` is this decoder without its
+macroblock layer: the same NAL handling, slice-header parsing, POC computation, reference marking
+and DPB output process, reported as events instead of pictures:
+
+```rust
+use filmcraft_h264::accel::{Event, Frontend};
+
+let mut fe = Frontend::from_avcc(&avcc)?; // or Frontend::new() for Annex B
+for (pts, access_unit) in access_units {
+    for e in fe.decode(access_unit, pts)? {
+        match e {
+            // p.id, p.sps / p.pps, p.frame_num, p.idr, p.idr_pic_id, p.reference, p.intra,
+            // p.poc (top, bottom), p.stored (as kept for reference), p.slices (NAL units),
+            // p.refs (reference pictures: id, FrameNum / LongTermFrameIdx, POCs), p.dpb (ids held)
+            Event::Decode(p) => {}
+            // o.id, o.pts, o.poc, o.key, o.crop, o.color, o.sar: in the software decoder's order
+            Event::Output(o) => {}
+        }
+    }
+}
+```
+
+A picture keeps its storage while a later `Decode` lists it in `dpb`, or until it is output;
+outputs arrive in the same calls, in the same order, as a single-threaded `Decoder` returns
+pictures. `filmcraft-platform` builds its Vulkan Video decoder on it
+([ADR 0002](../../docs/adr/0002-linux-vulkan-video.md)). Front-end mode does not allocate picture
+planes. Known difference: for a picture with MMCO 5, `poc` is the order count the picture is
+decoded with (8.2.1); the software decoder uses 0 for that picture's own inter prediction, which
+only matters for B pictures carrying MMCO 5 with temporal direct or implicit weighting (libx264
+never writes MMCO 5).
+
 ### Threading model
 
 The calling thread parses headers and performs all POC / DPB / reference-list bookkeeping (it only
@@ -118,6 +152,12 @@ with ffmpeg + libx264; tests print a message and skip when `/opt/homebrew/bin/ff
 - Vectorised kernels against their straightforward forms on random input: the deblocking edge
   filter against the per-line filter, the 4x4 / 8x8 inverse transforms against the per-column
   formulation.
+- Hardware front-end (`tests/accel.rs`): on every libx264 fixture the front-end outputs the same
+  pictures as the software decoder (order, pts, POC, key flag, crop, colour, aspect); per call it
+  outputs exactly what a single-threaded decoder returns; every picture is decoded before it is
+  output and output once; references and DPB lists name pictures still held; a simulated
+  hardware decoder with `max_dpb_frames + 1` slots never runs out of slots or overwrites a picture
+  still needed; slices pass through byte for byte; damaged input gives errors, never a panic.
 
 ### Fixture matrix (all bit-exact, single- and multi-threaded)
 

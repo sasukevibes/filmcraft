@@ -34,7 +34,8 @@ pub fn decode_json() -> Value {
         "decodeMsPerSample": g.decode_ms_per_sample(),
         "framesDecoded": g.frames,
         // Settings ▸ Playback ▸ Hardware decoding: pictures from OS hardware decoders vs ours,
-        // hardware decoders created, streams handed to software up front, mid-stream fallbacks.
+        // hardware decoders created, streams handed to software up front, mid-stream fallbacks,
+        // and hardware paths turned off because their pictures differed from ours (first use).
         "hardware": {
             "enabled": filmcraft_codecs::hw::hardware_decoding(),
             "frames": hw.frames,
@@ -42,6 +43,7 @@ pub fn decode_json() -> Value {
             "sessions": hw.sessions,
             "declined": hw.declined,
             "fallbacks": hw.fallbacks,
+            "mismatches": hw.mismatches,
         },
     })
 }
@@ -88,7 +90,7 @@ mod tests {
         ] {
             assert!(v["decode"][k].is_number(), "decode.{k} in {v}");
         }
-        for k in ["frames", "softwareFrames", "sessions", "declined", "fallbacks"] {
+        for k in ["frames", "softwareFrames", "sessions", "declined", "fallbacks", "mismatches"] {
             assert!(v["decode"]["hardware"][k].is_number(), "decode.hardware.{k} in {v}");
         }
         assert!(v["decode"]["hardware"]["enabled"].is_boolean());

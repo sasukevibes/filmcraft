@@ -31,6 +31,9 @@ pub struct OutputMeta {
 pub struct DpbEntry {
     pub frame: FrameRef,
     pub poc: i32,
+    /// TopFieldOrderCnt and BottomFieldOrderCnt as a reference (after an MMCO 5: relative to the
+    /// picture itself), for hardware front-ends.
+    pub field_poc: (i32, i32),
     pub frame_num: u32,
     pub long_term_frame_idx: u32,
     pub mark: RefMark,
@@ -141,6 +144,7 @@ impl Dpb {
             poc_state(unused);
             self.entries.push(DpbEntry {
                 poc: frame.poc,
+                field_poc: (frame.poc, frame.poc),
                 frame,
                 frame_num: unused,
                 long_term_frame_idx: 0,
@@ -329,6 +333,7 @@ impl Dpb {
         sh: &SliceHeader,
         frame: FrameRef,
         poc: i32,
+        field_poc: (i32, i32),
         max_frame_num: u32,
         max_num_ref_frames: usize,
         meta: Arc<OutputMeta>,
@@ -394,7 +399,17 @@ impl Dpb {
                 }
             }
         }
-        self.entries.push(DpbEntry { frame, poc, frame_num, long_term_frame_idx: long_idx, mark, needed_for_output: true, non_existing: false, meta });
+        self.entries.push(DpbEntry {
+            frame,
+            poc,
+            field_poc,
+            frame_num,
+            long_term_frame_idx: long_idx,
+            mark,
+            needed_for_output: true,
+            non_existing: false,
+            meta,
+        });
         // Low-delay output: honour max_num_reorder_frames.
         while self.entries.iter().filter(|e| e.needed_for_output).count() > self.max_reorder {
             if !self.bump(out) {

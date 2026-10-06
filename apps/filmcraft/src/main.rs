@@ -275,6 +275,11 @@ mod tests {
     fn startup_registers_the_hardware_decoders_without_a_logger() {
         assert!(!log::log_enabled!(log::Level::Info));
         let hardware = super::register_hardware_decoders();
-        assert_eq!(filmcraft_platform::registered(), cfg!(target_os = "macos"), "{hardware:?}");
+        // macOS always has VideoToolbox; Linux registers Vulkan Video when the loader is installed.
+        let available = matches!(hardware, filmcraft_platform::Availability::Available(_));
+        assert_eq!(filmcraft_platform::registered(), available, "{hardware:?}");
+        if cfg!(target_os = "macos") {
+            assert!(available, "{hardware:?}");
+        }
     }
 }

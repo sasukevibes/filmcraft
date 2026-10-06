@@ -20,6 +20,25 @@ impl ScalingMatrices {
     pub fn is_flat(&self) -> bool {
         self.m4.iter().all(|m| m.iter().all(|&v| v == 16)) && self.m8.iter().all(|m| m.iter().all(|&v| v == 16))
     }
+
+    /// The matrices as scaling lists in coded (zig-zag scan) order, the `ScalingList4x4` /
+    /// `ScalingList8x8` variables of 7.4.2.1.1 (what hardware decoder APIs take), in the same list
+    /// order as [`ScalingMatrices::m4`] / [`ScalingMatrices::m8`].
+    pub fn zigzag(&self) -> ([[u8; 16]; 6], [[u8; 64]; 6]) {
+        let mut l4 = [[0u8; 16]; 6];
+        let mut l8 = [[0u8; 64]; 6];
+        for (l, m) in l4.iter_mut().zip(&self.m4) {
+            for (k, v) in l.iter_mut().enumerate() {
+                *v = m[ZIGZAG4[k] as usize];
+            }
+        }
+        for (l, m) in l8.iter_mut().zip(&self.m8) {
+            for (k, v) in l.iter_mut().enumerate() {
+                *v = m[ZIGZAG8[k] as usize];
+            }
+        }
+        (l4, l8)
+    }
 }
 
 /// Lists as parsed, in zig-zag order, before inverse scanning.
@@ -712,5 +731,25 @@ mod tests {
         assert_eq!((sps.width(), sps.height()), (176, 144));
         assert_eq!(sps.pic_order_cnt_type, 2);
         assert_eq!(sps.crop_rect(), (0, 0, 176, 144));
+    }
+
+    /// `zigzag` gives back the lists as coded: the inverse of the raster conversion.
+    #[test]
+    fn zigzag_lists_round_trip() {
+        let mut lists = ZzLists::flat();
+        for (i, l) in lists.l4.iter_mut().enumerate() {
+            for (k, v) in l.iter_mut().enumerate() {
+                *v = (i * 16 + k + 1) as u8;
+            }
+        }
+        for (i, l) in lists.l8.iter_mut().enumerate() {
+            for (k, v) in l.iter_mut().enumerate() {
+                *v = (i * 7 + k + 3) as u8;
+            }
+        }
+        let (l4, l8) = lists.to_matrices().zigzag();
+        assert_eq!(l4, lists.l4);
+        assert_eq!(l8, lists.l8);
+        assert_eq!(ScalingMatrices::flat().zigzag(), ([[16; 16]; 6], [[16; 64]; 6]));
     }
 }

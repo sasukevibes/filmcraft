@@ -200,19 +200,31 @@ pub struct H264Decoder {
     dec: filmcraft_h264::Decoder,
     length_size: usize,
     draft: bool,
+    /// Worker threads (0: the decoder's default, every core).
+    threads: usize,
 }
 
 impl H264Decoder {
     pub fn new(avcc: Vec<u8>) -> Result<Self> {
+        Self::with_threads(avcc, 0)
+    }
+    /// A decoder with `threads` worker threads (0: every core). With one thread, every call returns
+    /// exactly the pictures the decoding process outputs in it, as hardware decoders built on
+    /// `filmcraft_h264::accel` do ([`crate::reference_video_decoder`]).
+    pub fn with_threads(avcc: Vec<u8>, threads: usize) -> Result<Self> {
         recycle_h264_planes();
-        let dec = filmcraft_h264::Decoder::from_avcc(&avcc).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let mut dec = Self::fresh(threads);
+        dec.configure_avcc(&avcc).map_err(|e| CodecError::Decode(e.to_string()))?;
         let length_size = avcc_length_size(&avcc);
-        Ok(Self { avcc, dec, length_size, draft: false })
+        Ok(Self { avcc, dec, length_size, draft: false, threads })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: MXF, TS).
     pub fn annexb() -> Self {
         recycle_h264_planes();
-        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::new(), length_size: 0, draft: false }
+        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::new(), length_size: 0, draft: false, threads: 0 }
+    }
+    fn fresh(threads: usize) -> filmcraft_h264::Decoder {
+        if threads == 0 { filmcraft_h264::Decoder::new() } else { filmcraft_h264::Decoder::with_threads(threads) }
     }
     fn convert(p: filmcraft_h264::Picture) -> DecodedFrame {
         use std::sync::Arc;
@@ -245,9 +257,8 @@ impl VideoDecoder for H264Decoder {
         self.dec.flush().into_iter().map(Self::convert).collect()
     }
     fn reset(&mut self) {
-        if self.avcc.is_empty() {
-            self.dec = filmcraft_h264::Decoder::new();
-        } else if let Ok(d) = filmcraft_h264::Decoder::from_avcc(&self.avcc) {
+        let mut d = Self::fresh(self.threads);
+        if self.avcc.is_empty() || d.configure_avcc(&self.avcc).is_ok() {
             self.dec = d;
         }
         self.dec.set_draft(self.draft);

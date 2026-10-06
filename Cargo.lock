@@ -2075,9 +2075,12 @@ dependencies = [
 name = "filmcraft-platform"
 version = "0.2.1"
 dependencies = [
+ "ash",
+ "filmcraft-bitstream",
  "filmcraft-codecs",
  "filmcraft-color",
  "filmcraft-frame",
+ "filmcraft-h264",
  "filmcraft-isobmff",
  "filmcraft-media",
  "filmcraft-testkit",

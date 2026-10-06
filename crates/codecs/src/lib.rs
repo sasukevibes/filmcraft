@@ -116,6 +116,17 @@ pub fn software_video_decoder(entry: &filmcraft_isobmff::SampleEntry) -> Result<
     Err(CodecError::Unsupported(format!("no decoder for {} video", entry.codec.name())))
 }
 
+/// Our software decoder for a sample entry as the reference a hardware decoder is checked against
+/// (first-use verification, `filmcraft_platform::HybridDecoder`): single-threaded where threads
+/// change when pictures come out (H.264), so each call returns exactly the pictures the decoding
+/// process outputs in it, as hardware decoders built on the same front-end do.
+pub fn reference_video_decoder(entry: &filmcraft_isobmff::SampleEntry) -> Result<Box<dyn VideoDecoder>> {
+    if let filmcraft_isobmff::CodecConfig::Avc(a) = &entry.codec {
+        return video::H264Decoder::with_threads(a.to_bytes(), 1).map(|d| Box::new(d) as Box<dyn VideoDecoder>);
+    }
+    software_video_decoder(entry)
+}
+
 /// Openers for the engine's media pool (MP4/MOV, Matroska/WebM, MXF, Ogg Opus/Vorbis, MPEG TS/PS and
 /// MPEG-1/2 video elementary streams, standalone audio).
 pub fn openers() -> Vec<filmcraft_media::Opener> {
