@@ -71,7 +71,7 @@ and `filmcraft-cli`.
 | `engine` | L4 | `Session`, command registry, undo history, media pool, jobs, interchange glue |
 | `ui-egui` | L5 | the egui frontend: docking, panels, timeline, monitors, playback, control-channel handlers |
 | `automation` | L5 | MCP server (`rmcp`, stdio), headless or bridged to the running app |
-| `platform` | L5 | OS media FFI only: hardware video decoding (VideoToolbox H.264 / HEVC on macOS; Vulkan Video H.264 on Linux, driven by `h264::accel`; a no-op elsewhere) behind `codecs::VideoDecoder`, with transparent fallback to our decoders. The one crate allowed `unsafe` ([ADR 0001](adr/0001-platform-ffi.md), [ADR 0002](adr/0002-linux-vulkan-video.md), [README](../crates/platform/README.md)) |
+| `platform` | L5 | OS media FFI only: hardware video decoding (VideoToolbox H.264 / HEVC on macOS; Vulkan Video H.264 / HEVC on Linux, driven by `h264::accel` / `hevc::accel`; a no-op elsewhere) behind `codecs::VideoDecoder`, with transparent fallback to our decoders. The one crate allowed `unsafe` ([ADR 0001](adr/0001-platform-ffi.md), [ADR 0002](adr/0002-linux-vulkan-video.md), [README](../crates/platform/README.md)) |
 | `filmcraft` | L6 | desktop binary: eframe/wgpu window, cpal audio output, file dialogs, native macOS menu, TCP control server |
 | `filmcraft-cli` | L6 | headless CLI: `exec`, `run`, `inspect`, `describe`, `commands`, `import`, `export`, `render`, `probe`, `mcp`; `--bridge` targets the running app |
 | `filmcraft-web` | L6 | the browser app (wasm32): eframe web runner on WebGPU/WebGL2, Blob-backed services, OPFS recovery, WebAudio, WebCodecs, `window.filmcraft` API ([web.md](web.md)) |
@@ -249,12 +249,14 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   mismatches.
   On Linux `register()` registers a Vulkan Video factory when the Vulkan loader is installed
   ([ADR 0002](adr/0002-linux-vulkan-video.md)); the GPU is opened on first use. It takes 8-bit
-  4:2:0 progressive H.264. Vulkan Video is stateless, so `h264::accel::Frontend` (the software
-  decoder's own header parsing, POC, reference marking and DPB output process, without the
-  macroblock layer) drives it: the GPU decodes each picture into a DPB slot, and each output is
-  copied back into planar `Yuv8` in the order the software decoder outputs. Until one stream has
-  matched our reference decoder bit for bit on its first pictures (`HybridDecoder::verifying`),
-  new streams are checked the same way; a mismatch turns the path off for the run.
+  4:2:0 progressive H.264 and HEVC Main / Main 10. Vulkan Video is stateless, so
+  `h264::accel::Frontend` / `hevc::accel::Frontend` (the software decoders' own header parsing,
+  POC, reference marking or reference picture sets and DPB output process, without the
+  reconstruction layers) drive it: the GPU decodes each picture into a DPB slot, and each output is
+  copied back into planar `Yuv8` / `Yuv16` in the order the software decoder outputs. Until one
+  stream of a kind (codec, bit depth, quantisation matrices) has matched our reference decoder bit
+  for bit on its first pictures (`HybridDecoder::verifying`), new streams of that kind are checked
+  the same way; a mismatch turns that kind off for the run.
   Decoders run slices on rayon, so an export worker waiting inside a decode can pick up another
   frame of the same source. A request that finds the shared decoder busy decodes with a private
   decoder.

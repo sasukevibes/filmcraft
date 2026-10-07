@@ -23,22 +23,26 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
   reorder buffer of the stream's own depth (`max_num_reorder_frames` /
   `sps_max_num_reorder_pics`) restores presentation order; a run starting at an HEVC CRA leaves
   out its RASL pictures, as our decoder does. Each seek (`reset`) starts a fresh session.
-- **Linux: Vulkan Video H.264 (`avcC`)**, 8-bit 4:2:0 progressive (`vulkan/`), **not yet run on
-  a GPU** (see Tests). `register()` only checks that the system Vulkan loader (`libvulkan.so.1`,
-  loaded at runtime through `ash`) opens; the GPU is opened when the first stream needs it: the
-  best GPU (discrete first) with Vulkan 1.3, a video decode queue that takes H.264, timeline
-  semaphores and synchronization2. Decoding is stateless: FilmCraft's own H.264 front-end
-  (`filmcraft_h264::accel`) parses the headers, computes picture order counts, marks references
-  and decides output order, and the GPU reconstructs pixels. Each stream gets a video session,
-  session parameters built from the `avcC` SPS / PPS (`vulkan/h264.rs`: every list given
-  explicitly, no fall-back left to the driver), and one layered image whose array layers are the
-  DPB slots and also the decode output (`DPB_AND_OUTPUT_COINCIDE`). A picture keeps its slot while
-  the front-end lists it in the DPB (`vulkan/slots.rs`); each output copies the slot's NV12 planes
-  into a host buffer and then into planar `Yuv8`, cropped. Every submission (decode on the video
-  queue, copy on it or on a transfer queue) waits for the previous one through a timeline
-  semaphore and is waited for on the host with a 2 s limit; a decode-status query reports decode
-  errors where the driver supports it. A seek (`reset`) keeps the session and resets its DPB state
-  on the next decode.
+- **Linux: Vulkan Video H.264 (`avcC`) and HEVC (`hvcC`)**: H.264 8-bit 4:2:0 progressive, HEVC
+  Main and Main 10 (8- and 10-bit 4:2:0) (`vulkan/`), **not yet run on a GPU** (see Tests).
+  `register()` only checks that the system Vulkan loader (`libvulkan.so.1`, loaded at runtime
+  through `ash`) opens; the GPU is opened when the first stream needs it: the best GPU (discrete
+  first) with Vulkan 1.3, a video decode queue that takes H.264 and / or HEVC, timeline semaphores
+  and synchronization2. Decoding is stateless: FilmCraft's own front-ends (`filmcraft_h264::accel`,
+  `filmcraft_hevc::accel`) parse the headers, compute picture order counts, apply the reference
+  marking (H.264) or reference picture sets (HEVC) and decide output order (HEVC: RASL pictures
+  after a CRA where decoding starts are skipped, as in software), and the GPU reconstructs pixels.
+  Each stream gets a video session, session parameters built from the configuration record's
+  parameter sets (`vulkan/h264.rs`: every H.264 scaling list given explicitly, no fall-back left to
+  the driver; `vulkan/h265.rs`: base-layer VPS / SPS / PPS, short-term RPSs in their explicit form,
+  scaling lists as coded with the defaults left to the driver), and one layered image whose array
+  layers are the DPB slots and also the decode output (`DPB_AND_OUTPUT_COINCIDE`). A picture keeps
+  its slot while the front-end lists it in the DPB (`vulkan/slots.rs`); each output copies the
+  slot's NV12 / P010 planes into a host buffer and then into planar `Yuv8` / `Yuv16`, cropped
+  (`vulkan/frames.rs`). Every submission (decode on the video queue, copy on it or on a transfer
+  queue) waits for the previous one through a timeline semaphore and is waited for on the host
+  with a 2 s limit; a decode-status query reports decode errors where the driver supports it. A
+  seek (`reset`) keeps the session and resets its DPB state on the next decode.
 - **Other systems:** `register()` does nothing and returns `Availability::Unavailable`.
 - **`HybridDecoder`** (`hybrid.rs`, safe code): the hardware decoder plus the means to build our
   software decoder for the same `SampleEntry` (`filmcraft_codecs::software_video_decoder`). On a
@@ -49,7 +53,9 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
   log is bounded (600 samples / 256 MB); beyond it one error is returned and the next seek restarts
   in software. Streams our decoders cannot decode (HEVC 4:2:2) have no fallback: the error stands.
   **First-use verification** (`HybridDecoder::verifying`, used by the Vulkan Video factory): the
-  first decoder of a hardware path in a process runs our reference decoder
+  first decoder of each kind of stream on a hardware path in a process (Vulkan Video: H.264, HEVC
+  8-bit and HEVC 10-bit, each with and without quantisation matrices,
+  `vulkan_verification_key`) runs our reference decoder
   (`filmcraft_codecs::reference_video_decoder`, single-threaded so each call returns what the
   front-end outputs in it) in lockstep and compares every picture of the first calls (8 pictures)
   bit for bit, returning the reference's pictures. A match marks the path verified for the run; a
@@ -63,11 +69,12 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
   when Settings ▸ Playback ▸ Hardware decoding is Off, for formats it does not take (field-coded
   H.264, bit depths other than 8 / 10, 4:4:4 or monochrome, luma / chroma depth mismatch, larger
   than 8192×8192) and when VideoToolbox cannot create a hardware session. The Vulkan Video factory
-  declines for everything but 8-bit 4:2:0 progressive H.264 that the software decoder also takes,
-  for profiles / levels / sizes / DPB sizes beyond the GPU's capabilities, when no GPU has a
-  Vulkan Video H.264 decoder, and when the decoded format cannot be copied out; mid-stream it
-  fails over to software on a decode error, a `frame_num` gap (non-existing reference frames), a
-  lost device or a 2 s timeout.
+  declines for everything but 8-bit 4:2:0 progressive H.264 and HEVC Main / Main 10 4:2:0 that the
+  software decoders also take, for profiles / levels / sizes / DPB sizes beyond the GPU's
+  capabilities, for parameter sets of different picture sizes in one record, when no GPU has a
+  Vulkan Video decoder for the codec, and when the decoded format cannot be copied out; mid-stream
+  it fails over to software on a decode error, missing reference pictures (an H.264 `frame_num`
+  gap, an HEVC RPS naming a picture that is not there), a lost device or a 2 s timeout.
 - **Interchangeable:** colour, pixel aspect, pts, presentation order, `is_random_access` and
   `is_disposable` come from the software decoders' own helpers (`filmcraft_codecs::hw`,
   `video::vui_color`, `sar_par`).
@@ -85,8 +92,9 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
 | `tests/setting.rs` | Hardware decoding Off gives the software decoder through `make_video_decoder` and the media stack (no hardware frames); Auto gives VideoToolbox where available |
 | `tests/verify.rs` (every OS) | first-use verification with stand-in hardware decoders: matching pictures verify the path; a damaged picture (first or fourth output) never reaches the caller, turns the path off and is counted; a hardware error, an early drop or a damaged stream give the check back; the check continues across seeks |
 | `src/vulkan/h264.rs` (Linux) | every field of the std SPS / PPS structures and of each picture's decode info (`frame_num`, `idr_pic_id`, IDR and reference flags) against `ffmpeg -bsf:v trace_headers` on three libx264 streams (custom scaling matrices, weighted prediction, cropping, CAVLC / CABAC, POC types 0 and 2, four references); levels, profiles, bitstream layout |
-| `src/vulkan/slots.rs`, `decoder.rs` (Linux) | slot reuse rules; NV12 → planar cropping and deinterleaving, hostile crops and short buffers |
-| `tests/vulkan_video.rs` (Linux) | **without a Vulkan Video device** (CI, cloud, Mesa lavapipe): H.264 goes to the software decoder, declined and counted, never left claimed. **With one** (not run yet): five libx264 fixtures (High B-pyramid 640×360 cropped, Main ref=4 weightp, Baseline 4 slices, High cqm=jvt, 1080p) bit-exact with the software decoder, also after reset + reseek to every later sync sample and after resets; forced failures at five points continue with the software output; the factory verifies on first use and Off gives software; damaged samples and parameter sets never crash or hang |
+| `src/vulkan/h265.rs` (Linux) | every field of the std VPS / SPS / PPS structures (profile, tier, level, DPB sizes, conformance window, coding tools, deblocking and QP offsets), the resolved scaling lists with their DC values, and each picture's decode info (IRAP / IDR flags, POC, `NumBitsForSTRefPicSetInSlice`, the RPS lists in bitstream order as DPB slots, every RPS picture a reference) against `ffmpeg -bsf:v trace_headers` on three libx265 streams (open GOP with CRA and RASL pictures, conformance window, two slices, default scaling lists; Main 10 with transform skip, transquant bypass, constrained intra, deblocking and chroma QP offsets; custom scaling lists with DC values below 8 and a predicted list); mutating the DC semantics, the RPS bit count or the list order fails it |
+| `src/vulkan/slots.rs`, `frames.rs` (Linux) | slot reuse rules; NV12 / P010 → planar cropping, deinterleaving and shifting, hostile crops, sample sizes and short buffers |
+| `tests/vulkan_video.rs` (Linux) | **without a Vulkan Video device** (CI, cloud, Mesa lavapipe): H.264 and HEVC go to the software decoders, declined and counted, never left claimed; each kind of stream gets its own verification key. **With one** (not run yet): eleven fixtures, five libx264 (High B-pyramid 640×360 cropped, Main ref=4 weightp, Baseline 4 slices, High cqm=jvt, 1080p) and six libx265 (Main open GOP, Main 10, three slices with default scaling lists at 638×358, custom scaling lists, Main 10 with transform skip and transquant bypass, 1080p open GOP), bit-exact with the software decoder, also after reset + reseek to every later sync sample and after resets; forced failures at five points continue with the software output (H.264, HEVC, HEVC Main 10); the factory verifies each kind on first use and Off gives software; damaged samples and parameter sets never crash or hang |
 
 Fixtures are made with ffmpeg into `target/fixtures/platform/` (generator only, never linked);
 tests skip without ffmpeg or without a hardware decoder.
@@ -95,13 +103,21 @@ tests skip without ffmpeg or without a hardware decoder.
 
 ```sh
 vulkaninfo --summary | grep -iE "deviceName|driverName"     # the GPU and driver Vulkan sees
-vulkaninfo | grep -E "VK_KHR_video_decode_h264|VIDEO_DECODE" # its video decode support
+vulkaninfo | grep -E "VK_KHR_video_decode_h26[45]|VIDEO_DECODE" # its video decode support
 cargo test --release -p filmcraft-platform --test vulkan_video -- --nocapture --test-threads 1
 ```
 
-The first line of output names the device (`Vulkan Video device: …`); `SKIPPED` means none was
-found and says why. In the app, `perf.stats` (control channel / MCP) shows
-`decode.hardware.frames` against `softwareFrames`, and `declined` / `fallbacks` / `mismatches`.
+The first line of output names the device and the codecs it decodes (`Vulkan Video device: …`);
+`SKIPPED` means none was found and says why. On Arch-based systems (Omarchy included)
+`vulkaninfo` comes from `vulkan-tools`, the loader from `vulkan-icd-loader`, and the NVIDIA
+Vulkan driver from the NVIDIA driver's `nvidia-utils`. In the app, `perf.stats` (control channel
+/ MCP) shows `decode.hardware.frames` against `softwareFrames`, and `declined` / `fallbacks` /
+`mismatches`. Speed, Off against Auto (the numbers go to `target/bench/`):
+
+```sh
+cargo xtask bench --sections decode --only dec_ --repeat 3 --hw off --label hw-off
+cargo xtask bench --sections decode --only dec_ --repeat 3 --hw auto --label hw-auto
+```
 
 ## Performance
 
@@ -113,7 +129,8 @@ playback with no dropped frames at Full, 1/2 and 1/4. Details in
 ## Not yet
 
 Zero-copy upload of `CVPixelBuffer`s / Vulkan images into wgpu textures; hardware encoding; Media
-Foundation / D3D11 (Windows) decoders; field-coded H.264. Linux: a run on real GPUs; HEVC and AV1
-through Vulkan Video; drivers that only offer a decode output separate from the DPB
+Foundation / D3D11 (Windows) decoders; field-coded H.264. Linux: a run on real GPUs; AV1 and VP9
+through Vulkan Video; HEVC 4:2:2 / 4:4:4 and 12-bit (range extensions); drivers that only offer a
+decode output separate from the DPB
 (`DPB_AND_OUTPUT_DISTINCT`, some AMD GPUs) or no copy out of DPB images; pipelining (each picture
 is decoded and copied synchronously); VA-API for machines without a Vulkan Video driver.

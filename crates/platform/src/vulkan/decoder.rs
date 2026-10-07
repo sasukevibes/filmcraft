@@ -8,12 +8,12 @@
 
 use filmcraft_codecs::hw::{NalCodec, NalStreamInfo};
 use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
-use filmcraft_frame::{Chroma, PixelData, VideoFrame, pool};
 use filmcraft_h264::accel::{DecodePicture, Event, Frontend, OutputPicture};
 use filmcraft_h264::params::{Pps, Sps};
 use std::sync::Arc;
 
-use super::ffi::{DecodeJob, Session, SessionSpec};
+use super::ffi::{Codec, DecodeJob, Params, PictureInfo, RefInfo, Session, SessionSpec};
+use super::frames::{self, Presentation};
 use super::h264;
 use super::slots::Slots;
 
@@ -34,7 +34,7 @@ pub struct VulkanH264Decoder {
 }
 
 /// The SPS and PPS of a stream's configuration record (each PPS parsed against its SPS).
-fn parse_parameter_sets(info: &NalStreamInfo) -> std::result::Result<(Vec<Sps>, Vec<Pps>), String> {
+pub(super) fn parse_parameter_sets(info: &NalStreamInfo) -> std::result::Result<(Vec<Sps>, Vec<Pps>), String> {
     let mut table: Vec<Option<Sps>> = vec![None; 32];
     let mut ppss = Vec::new();
     for nal in &info.parameter_sets {
@@ -47,7 +47,12 @@ fn parse_parameter_sets(info: &NalStreamInfo) -> std::result::Result<(Vec<Sps>, 
                     *slot = Some(sps);
                 }
             }
-            8 => ppss.push(Pps::parse(&rbsp, &table).map_err(|e| format!("PPS: {e}"))?),
+            8 => {
+                let pps = Pps::parse(&rbsp, &table).map_err(|e| format!("PPS: {e}"))?;
+                // a later PPS with the same id replaces an earlier one, as in the software decoder
+                ppss.retain(|p: &Pps| p.id != pps.id);
+                ppss.push(pps);
+            }
             _ => {}
         }
     }
@@ -84,15 +89,18 @@ impl VulkanH264Decoder {
             }
             profile = Some(p);
             level = level.max(h264::std_level(sps.level_idc)?);
-            w = w.max(sps.width());
-            h = h.max(sps.height());
+            // every picture is decoded at the session's coded size
+            if (w, h) != (0, 0) && (w, h) != (sps.width(), sps.height()) {
+                return Err("SPSs of different picture sizes".into());
+            }
+            (w, h) = (sps.width(), sps.height());
             slots = slots.max(sps.max_dpb_frames() + 1);
             max_refs = max_refs.max(sps.max_num_ref_frames as usize);
         }
         let profile = profile.ok_or("no SPS")?;
         let sets = h264::parameter_sets(&spss, &ppss)?;
         let spec = SessionSpec {
-            profile,
+            codec: Codec::H264(profile),
             level,
             coded: (w, h),
             slots: u32::try_from(slots).map_err(|_| "DPB size overflows".to_string())?,
@@ -100,7 +108,7 @@ impl VulkanH264Decoder {
         };
         let dev = super::device()?;
         let name = format!("Vulkan Video H.264 ({})", dev.name);
-        let session = Session::new(Arc::clone(&dev), &spec, &sets)?;
+        let session = Session::new(Arc::clone(&dev), &spec, Params::H264(&sets))?;
         let frontend = Frontend::from_avcc(&avcc).map_err(|e| e.to_string())?;
         Ok(Self { session, avcc, frontend, info, slots: Slots::new(slots), reset_session: true, max_refs, fail_after: None, fed: 0, name })
     }
@@ -132,14 +140,14 @@ impl VulkanH264Decoder {
         let mut refs = Vec::with_capacity(p.refs.len());
         for r in &p.refs {
             let slot = self.slots.slot_of(r.id).ok_or_else(|| format!("reference picture {} was never decoded", r.id))?;
-            refs.push((slot, h264::reference_info(r)?));
+            refs.push((slot, RefInfo::H264(h264::reference_info(r)?)));
         }
-        let (bitstream, offsets) = h264::bitstream(&p.slices)?;
+        let (bitstream, offsets) = super::bitstream(&p.slices)?;
         let job = DecodeJob {
             bitstream: &bitstream,
             slice_offsets: &offsets,
-            picture: h264::picture_info(p)?,
-            setup: (layer, h264::setup_info(p)?),
+            picture: PictureInfo::H264(h264::picture_info(p)?),
+            setup: (layer, RefInfo::H264(h264::setup_info(p)?)),
             refs: &refs,
             reset: self.reset_session,
         };
@@ -151,47 +159,12 @@ impl VulkanH264Decoder {
     fn output(&mut self, o: &OutputPicture) -> std::result::Result<DecodedFrame, String> {
         let layer = self.slots.slot_of(o.id).ok_or_else(|| format!("picture {} is output but was never decoded", o.id))?;
         let (iw, ih) = self.session.image_size();
+        let presentation =
+            Presentation { crop: o.crop, matrix: o.color.matrix, transfer: o.color.transfer, full_range: o.color.full_range, sar: o.sar, bits: 8 };
         let planes = self.session.read_picture(layer)?;
-        let frame = nv12_frame(planes, iw, ih, o)?;
+        let frame = frames::frame(planes, iw, ih, 1, &presentation)?;
         Ok(DecodedFrame { pts: o.pts, frame, draft: false })
     }
-}
-
-/// A planar 4:2:0 frame from tightly packed NV12 planes of an `iw`×`ih` image, cropped to the
-/// output's window.
-fn nv12_frame(data: &[u8], iw: u32, ih: u32, o: &OutputPicture) -> std::result::Result<VideoFrame, String> {
-    let (cx, cy, cw, ch) = o.crop;
-    if cw == 0 || ch == 0 || cx.checked_add(cw).is_none_or(|r| r > iw) || cy.checked_add(ch).is_none_or(|b| b > ih) {
-        return Err(format!("crop {cw}x{ch}+{cx}+{cy} outside the {iw}x{ih} picture"));
-    }
-    let (iw, ih) = (iw as usize, ih as usize);
-    let (cx, cy, w, h) = (cx as usize, cy as usize, cw as usize, ch as usize);
-    let luma = iw * ih;
-    if data.len() < luma + luma / 2 {
-        return Err("decoded picture is smaller than expected".into());
-    }
-    let row = |start: usize, len: usize| data.get(start..start + len).ok_or_else(|| "decoded picture row out of range".to_string());
-    let mut y = pool::take_u8(w * h);
-    for r in 0..h {
-        y.extend_from_slice(row((cy + r) * iw + cx, w)?);
-    }
-    let (cw2, ch2) = (w.div_ceil(2), h.div_ceil(2));
-    let (cox, coy) = (cx / 2, cy / 2);
-    let (mut u, mut v) = (pool::take_u8(cw2 * ch2), pool::take_u8(cw2 * ch2));
-    for r in 0..ch2 {
-        for pair in row(luma + (coy + r) * iw + cox * 2, cw2 * 2)?.as_chunks::<2>().0 {
-            u.push(pair[0]);
-            v.push(pair[1]);
-        }
-    }
-    Ok(VideoFrame {
-        width: cw,
-        height: ch,
-        data: PixelData::Yuv8 { planes: [Arc::new(y), Arc::new(u), Arc::new(v)], chroma: Chroma::C420, alpha: None },
-        color: filmcraft_codecs::video::vui_color(cw, ch, o.color.matrix, o.color.transfer, o.color.full_range),
-        par: filmcraft_codecs::video::sar_par(o.sar),
-        pts: filmcraft_time::Tick::ZERO,
-    })
 }
 
 impl VideoDecoder for VulkanH264Decoder {
@@ -233,49 +206,5 @@ impl VideoDecoder for VulkanH264Decoder {
 
     fn is_disposable(&self, sample: &[u8]) -> bool {
         self.info.is_disposable(sample)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn output(crop: (u32, u32, u32, u32)) -> OutputPicture {
-        OutputPicture {
-            id: 1,
-            pts: 7,
-            poc: 0,
-            key: true,
-            crop,
-            color: filmcraft_h264::ColorInfo { full_range: false, primaries: 1, transfer: 1, matrix: 1 },
-            sar: (0, 0),
-        }
-    }
-
-    /// NV12 planes become cropped planar planes: luma rows, chroma deinterleaved.
-    #[test]
-    fn nv12_planes_are_cropped_and_deinterleaved() {
-        let (iw, ih) = (8u32, 4u32);
-        let mut data: Vec<u8> = (0..32).collect();
-        // chroma rows: (U, V) pairs 100+, 200+
-        for r in 0..2 {
-            for c in 0..4 {
-                data.push(100 + (r * 4 + c) as u8);
-                data.push(200 + (r * 4 + c) as u8);
-            }
-        }
-        let f = nv12_frame(&data, iw, ih, &output((2, 2, 4, 2))).unwrap();
-        assert_eq!((f.width, f.height), (4, 2));
-        let PixelData::Yuv8 { planes, chroma, .. } = &f.data else { panic!("8-bit planar") };
-        assert_eq!(*chroma, Chroma::C420);
-        assert_eq!(*planes[0], [18, 19, 20, 21, 26, 27, 28, 29]);
-        assert_eq!(*planes[1], [105, 106]);
-        assert_eq!(*planes[2], [205, 206]);
-        assert_eq!(f.par, (1, 1));
-        // crops outside the picture and short buffers are errors
-        assert!(nv12_frame(&data, iw, ih, &output((6, 0, 4, 2))).is_err());
-        assert!(nv12_frame(&data, iw, ih, &output((0, 0, 0, 2))).is_err());
-        assert!(nv12_frame(&data[..40], iw, ih, &output((0, 0, 8, 4))).is_err());
-        assert!(nv12_frame(&data, iw, ih, &output((u32::MAX, 0, 2, 2))).is_err());
     }
 }

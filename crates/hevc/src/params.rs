@@ -15,6 +15,8 @@ pub struct ProfileTierLevel {
     pub compatibility: u32,
     pub progressive_source: bool,
     pub interlaced_source: bool,
+    pub non_packed_constraint: bool,
+    pub frame_only_constraint: bool,
     pub level_idc: u8,
 }
 
@@ -27,7 +29,8 @@ pub fn parse_ptl(r: &mut BitReader, profile_present: bool, max_sub_layers_minus1
         p.compatibility = r.read_bits(32)?;
         p.progressive_source = r.read_flag()?;
         p.interlaced_source = r.read_flag()?;
-        r.skip(2)?; // non_packed, frame_only
+        p.non_packed_constraint = r.read_flag()?;
+        p.frame_only_constraint = r.read_flag()?;
         r.skip(43)?; // constraint flags / reserved bits (always 43 bits)
         r.skip(1)?; // inbld / reserved
     }
@@ -115,6 +118,7 @@ pub fn skip_hrd(r: &mut BitReader, common: bool, max_sub_layers_minus1: u32) -> 
 pub struct Vps {
     pub id: u8,
     pub max_sub_layers_minus1: u32,
+    pub temporal_id_nesting: bool,
     pub ptl: ProfileTierLevel,
 }
 
@@ -124,9 +128,10 @@ impl Vps {
         let id = r.read_bits(4)? as u8;
         r.skip(2 + 6)?;
         let max_sub_layers_minus1 = r.read_bits(3)?;
-        r.skip(1 + 16)?;
+        let temporal_id_nesting = r.read_flag()?;
+        r.skip(16)?;
         let ptl = parse_ptl(&mut r, true, max_sub_layers_minus1)?;
-        Ok(Vps { id, max_sub_layers_minus1, ptl })
+        Ok(Vps { id, max_sub_layers_minus1, temporal_id_nesting, ptl })
     }
 }
 
@@ -339,11 +344,18 @@ impl StRps {
     /// st_ref_pic_set(idx) with the previously parsed candidate sets `sets` (idx == sets.len() for a
     /// slice-header RPS).
     pub fn parse(r: &mut BitReader, idx: usize, sets: &[StRps], num_sets: usize) -> Result<StRps> {
+        Self::parse_with_ref(r, idx, sets, num_sets).map(|(s, _)| s)
+    }
+
+    /// As [`StRps::parse`], also returning NumDeltaPocs[RefRpsIdx] of the set it was predicted
+    /// from (0 when not predicted), which hardware decoders take for slice-header RPSs.
+    pub fn parse_with_ref(r: &mut BitReader, idx: usize, sets: &[StRps], num_sets: usize) -> Result<(StRps, u32)> {
         let inter = if idx != 0 { r.read_flag()? } else { false };
         if inter {
             let delta_idx = if idx == num_sets { r.read_ue()? as usize + 1 } else { 1 };
             ensure!(delta_idx <= idx, "delta_idx_minus1 out of range");
             let rf = &sets[idx - delta_idx];
+            let ref_delta_pocs = rf.num_delta_pocs() as u32;
             let sign = r.read_flag()?;
             let abs = r.read_ue()? as i32 + 1;
             ensure!(abs <= 1 << 15, "abs_delta_rps_minus1 out of range");
@@ -390,7 +402,7 @@ impl StRps {
                 }
             }
             ensure!(out.num_delta_pocs() <= 16, "too many pictures in RPS");
-            Ok(out)
+            Ok((out, ref_delta_pocs))
         } else {
             let nneg = r.read_ue()? as usize;
             let npos = r.read_ue()? as usize;
@@ -410,7 +422,7 @@ impl StRps {
                 poc += d;
                 out.s1.push((poc, r.read_flag()?));
             }
-            Ok(out)
+            Ok((out, 0))
         }
     }
 }
@@ -420,13 +432,14 @@ impl StRps {
 pub struct Sps {
     pub vps_id: u8,
     pub max_sub_layers_minus1: u32,
+    pub temporal_id_nesting: bool,
     pub ptl: ProfileTierLevel,
     pub id: u32,
     pub chroma_format_idc: u32,
     pub separate_colour_plane: bool,
     pub width: u32,
     pub height: u32,
-    /// Conformance window in luma samples (left, right, top, bottom).
+    /// Conformance window offsets as coded, in chroma sample units (left, right, top, bottom).
     pub conf_win: (u32, u32, u32, u32),
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
@@ -441,6 +454,8 @@ pub struct Sps {
     pub max_th_depth_inter: u32,
     pub max_th_depth_intra: u32,
     pub scaling_list_enabled: bool,
+    /// sps_scaling_list_data_present_flag: the lists are coded in the SPS (not the defaults).
+    pub scaling_list_data_present: bool,
     /// SPS-level scaling list (defaults when enabled without data).
     pub scaling_list: Option<ScalingList>,
     pub amp: bool,
@@ -469,7 +484,7 @@ impl Sps {
         let vps_id = r.read_bits(4)? as u8;
         let max_sub_layers_minus1 = r.read_bits(3)?;
         ensure!(max_sub_layers_minus1 <= 6, "sps_max_sub_layers_minus1 out of range");
-        r.skip(1)?;
+        let temporal_id_nesting = r.read_flag()?;
         let ptl = parse_ptl(&mut r, true, max_sub_layers_minus1)?;
         let id = r.read_ue()?;
         ensure!(id < 16, "sps_seq_parameter_set_id out of range");
@@ -510,8 +525,10 @@ impl Sps {
         ensure!(max_th_depth_inter <= log2_ctb - log2_min_tb && max_th_depth_intra <= log2_ctb - log2_min_tb, "transform hierarchy depth out of range");
         let scaling_list_enabled = r.read_flag()?;
         let mut scaling_list = None;
+        let mut scaling_list_data_present = false;
         if scaling_list_enabled {
-            scaling_list = Some(if r.read_flag()? { ScalingList::parse(&mut r)? } else { ScalingList::default_lists() });
+            scaling_list_data_present = r.read_flag()?;
+            scaling_list = Some(if scaling_list_data_present { ScalingList::parse(&mut r)? } else { ScalingList::default_lists() });
         }
         let amp = r.read_flag()?;
         let sao = r.read_flag()?;
@@ -558,6 +575,7 @@ impl Sps {
         Ok(Sps {
             vps_id,
             max_sub_layers_minus1,
+            temporal_id_nesting,
             ptl,
             id,
             chroma_format_idc,
@@ -578,6 +596,7 @@ impl Sps {
             max_th_depth_inter,
             max_th_depth_intra,
             scaling_list_enabled,
+            scaling_list_data_present,
             scaling_list,
             amp,
             sao,

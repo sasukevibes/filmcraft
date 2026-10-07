@@ -32,6 +32,7 @@ ash = { version = "0.38", default-features = false, features = ["loaded", "std"]
 filmcraft-bitstream = { workspace = true }
 filmcraft-frame = { workspace = true }
 filmcraft-h264 = { workspace = true }
+filmcraft-hevc = { workspace = true }
 filmcraft-time = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

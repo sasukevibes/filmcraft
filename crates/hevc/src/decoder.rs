@@ -5,7 +5,8 @@
 //! feature) that publishes finished CTB rows into the picture's shared [`Frame`]; jobs of later pictures
 //! block per row on the reference data they read, so several pictures decode concurrently.
 
-use crate::dpb::{Dpb, Output, OutputMeta, PocState, RefPicSet, build_ref_lists};
+use crate::accel;
+use crate::dpb::{Dpb, Marking, Output, OutputMeta, PocState, RefPicSet, build_ref_lists};
 use crate::error::{Error, Result, ensure, invalid};
 use crate::params::{Layout, Pps, Sps, Vps};
 use crate::picture::{Frame, FrameRef};
@@ -30,6 +31,8 @@ struct PendingPic {
     output: bool,
     meta: Arc<OutputMeta>,
     slices: Vec<SliceJob>,
+    /// Front-end mode: the slice segment NAL units as received.
+    nals: Vec<Vec<u8>>,
 }
 
 /// Counters describing what the decoder has seen (useful to check test coverage).
@@ -89,6 +92,9 @@ pub struct Decoder {
     in_flight: VecDeque<FrameRef>,
     max_in_flight: usize,
     draft: bool,
+    /// Hardware front-end mode ([`crate::accel::Frontend`]): pictures are reported as events
+    /// instead of being decoded, and outputs go here instead of `out_queue`.
+    accel: Option<Vec<accel::Event>>,
 }
 
 impl Default for Decoder {
@@ -143,6 +149,50 @@ impl Decoder {
             in_flight: VecDeque::new(),
             max_in_flight: threads.max(1) + 2,
             draft: false,
+            accel: None,
+        }
+    }
+
+    /// A decoder in hardware front-end mode ([`crate::accel::Frontend`]): no worker threads, no
+    /// pixel decoding.
+    pub(crate) fn accel() -> Self {
+        let mut d = Self::with_threads(1);
+        d.accel = Some(Vec::new());
+        d
+    }
+
+    /// Front-end mode: one access unit, as [`Decoder::decode`], reported as events.
+    pub(crate) fn decode_accel(&mut self, data: &[u8], pts: i64) -> Result<Vec<accel::Event>> {
+        let nals = match self.nal_length_size {
+            Some(n) => length_prefixed_nals(data, n)?,
+            None => annexb_nals(data),
+        };
+        let mut result = Ok(());
+        for nal in nals {
+            if let Err(e) = self.handle_nal(nal, pts) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.submit_pending();
+        let events = self.accel.as_mut().map(std::mem::take).unwrap_or_default();
+        result.map(|()| events)
+    }
+
+    /// Front-end mode: end of stream, as [`Decoder::flush`].
+    pub(crate) fn flush_accel(&mut self) -> Vec<accel::Event> {
+        self.submit_pending();
+        let mut outs = Vec::new();
+        self.dpb.flush(&mut outs);
+        self.emit(outs);
+        self.first_picture = true;
+        self.accel.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    fn emit(&mut self, outs: Vec<Output>) {
+        match self.accel.as_mut() {
+            Some(events) => events.extend(outs.iter().map(|o| accel::Event::Output(accel_output(o)))),
+            None => self.out_queue.extend(outs),
         }
     }
 
@@ -353,6 +403,9 @@ impl Decoder {
         if !sh.dependent {
             pending.last_sh = sh.clone();
         }
+        if self.accel.is_some() {
+            pending.nals.push(nal.to_vec());
+        }
         let (st, dependent, weighted, tmvp, sao, dbk_off, lt) =
             (sh.slice_type, sh.dependent, sh.pwt.is_some(), sh.temporal_mvp, sh.sao_luma || sh.sao_chroma, sh.deblocking_disabled, !sh.lt.is_empty());
         pending.slices.push(SliceJob { sh, pps, sps, rbsp, refs });
@@ -410,10 +463,15 @@ impl Decoder {
         let template = Frame::new(0, 0, w, h, sps.log2_ctb, sps.bit_depth_luma, sps.bit_depth_chroma);
         let next_id = &mut self.next_id;
         let mut missing = 0u64;
+        let accel = self.accel.is_some();
         let mut make_missing = |p: i32| -> FrameRef {
             missing += 1;
             let id = *next_id;
             *next_id += 1;
+            if accel {
+                // No samples in front-end mode: an empty frame stands for it (never read).
+                return Arc::new(Frame::new(id, p, w, h, template.log2_ctb, template.bit_depth, template.bit_depth_c));
+            }
             Arc::new(Frame::gray(id, p, &template))
         };
         let rps = self.dpb.apply_rps(sh, poc, max_lsb, irap_no_rasl, &mut make_missing)?;
@@ -429,7 +487,7 @@ impl Decoder {
         } else {
             self.dpb.bump_before_decode(&mut outs);
         }
-        self.out_queue.extend(outs);
+        self.emit(outs);
         let (layout, scaling) = self.layout_for(pps, sps)?;
         let _ = scaling;
         let id = self.next_id;
@@ -455,6 +513,7 @@ impl Decoder {
             output,
             meta,
             slices: Vec::new(),
+            nals: Vec::new(),
         });
         self.first_picture = false;
         self.after_eos = false;
@@ -470,13 +529,52 @@ impl Decoder {
     /// Start decoding the pending picture and insert it into the DPB.
     fn submit_pending(&mut self) {
         let Some(p) = self.pending.take() else { return };
-        let PendingPic { frame, sps, pps, layout, first_sh, poc, output, meta, slices, .. } = p;
-        let scaling = self.layout_cache.iter().find(|(pp, ss, _, _)| Arc::ptr_eq(pp, &pps) && Arc::ptr_eq(ss, &sps)).and_then(|(_, _, _, s)| s.clone());
-        self.dispatch(frame.clone(), sps, pps, layout, scaling, slices, meta.draft);
+        let PendingPic { frame, sps, pps, layout, first_sh, rps, poc, output, meta, slices, nals, .. } = p;
+        if self.accel.is_some() {
+            // Front-end mode: the picture's parameters, with the DPB as it is after its RPS.
+            let held = |id: u32| self.dpb.entries.iter().any(|e| e.frame.id == id);
+            let mut refs: Vec<accel::Reference> = self
+                .dpb
+                .entries
+                .iter()
+                .filter(|e| e.marking != Marking::Unused)
+                .map(|e| accel::Reference { id: e.frame.id, poc: e.poc, long_term: e.marking == Marking::Long, non_existing: false })
+                .collect();
+            for r in rps.st_curr_before.iter().chain(&rps.st_curr_after).chain(&rps.lt_curr) {
+                if !held(r.frame.id) {
+                    refs.push(accel::Reference { id: r.frame.id, poc: r.poc, long_term: r.long_term, non_existing: true });
+                }
+            }
+            let ids = |v: &Vec<crate::picture::RefPic>| v.iter().map(|r| r.frame.id).collect::<Vec<u32>>();
+            let pic = accel::DecodePicture {
+                id: frame.id,
+                vps: self.vpss.get(sps.vps_id as usize).and_then(|v| v.clone()),
+                sps: sps.clone(),
+                pps: pps.clone(),
+                poc,
+                irap: first_sh.nal.is_irap(),
+                idr: first_sh.nal.is_idr(),
+                st_rps_sps: first_sh.st_rps_sps,
+                st_rps_bits: first_sh.st_rps_bits as u32,
+                st_rps_ref_delta_pocs: first_sh.st_rps_ref_delta_pocs,
+                slices: nals,
+                st_curr_before: ids(&rps.st_curr_before),
+                st_curr_after: ids(&rps.st_curr_after),
+                lt_curr: ids(&rps.lt_curr),
+                refs,
+                dpb: self.dpb.entries.iter().map(|e| e.frame.id).collect(),
+            };
+            if let Some(events) = self.accel.as_mut() {
+                events.push(accel::Event::Decode(pic));
+            }
+        } else {
+            let scaling = self.layout_cache.iter().find(|(pp, ss, _, _)| Arc::ptr_eq(pp, &pps) && Arc::ptr_eq(ss, &sps)).and_then(|(_, _, _, s)| s.clone());
+            self.dispatch(frame.clone(), sps, pps, layout, scaling, slices, meta.draft);
+        }
         self.poc_state.update(&first_sh, poc);
         let mut outs = Vec::new();
         self.dpb.insert(frame, poc, output, meta, &mut outs);
-        self.out_queue.extend(outs);
+        self.emit(outs);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -559,6 +657,25 @@ fn run_job(
     }
     if let (Some(e), Ok(mut slot)) = (err, shared.error.lock()) {
         slot.get_or_insert(e);
+    }
+}
+
+/// An output as the front-end reports it (the fields [`make_picture`] copies).
+fn accel_output(o: &Output) -> accel::OutputPicture {
+    accel::OutputPicture {
+        id: o.frame.id,
+        pts: o.meta.pts,
+        poc: o.poc,
+        key: o.meta.key,
+        crop: o.meta.crop,
+        color: ColorInfo {
+            full_range: o.meta.full_range,
+            primaries: o.meta.colour_primaries,
+            transfer: o.meta.transfer_characteristics,
+            matrix: o.meta.matrix_coefficients,
+        },
+        sar: o.meta.sar,
+        bit_depth: o.meta.bit_depth,
     }
 }
 

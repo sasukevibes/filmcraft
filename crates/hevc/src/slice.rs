@@ -110,6 +110,10 @@ pub struct SliceHeader {
     /// The short-term RPS used by this picture (from the SPS or the header).
     pub st_rps: StRps,
     pub st_rps_bits: usize,
+    /// `short_term_ref_pic_set_sps_flag`.
+    pub st_rps_sps: bool,
+    /// NumDeltaPocs[RefRpsIdx] of a slice-header RPS predicted from an SPS one (else 0).
+    pub st_rps_ref_delta_pocs: u32,
     /// Long-term entries: (PocLsbLt, UsedByCurrPicLt, delta_poc_msb_present, DeltaPocMsbCycleLt).
     pub lt: Vec<(u32, bool, bool, u32)>,
     pub temporal_mvp: bool,
@@ -196,6 +200,8 @@ impl SliceHeader {
                 poc_lsb: 0,
                 st_rps: StRps::default(),
                 st_rps_bits: 0,
+                st_rps_sps: false,
+                st_rps_ref_delta_pocs: 0,
                 lt: Vec::new(),
                 temporal_mvp: false,
                 sao_luma: false,
@@ -245,9 +251,10 @@ impl SliceHeader {
             if !nal.is_idr() {
                 sh.poc_lsb = r.read_bits(sps.log2_max_poc_lsb)?;
                 let from_sps = r.read_flag()?;
+                sh.st_rps_sps = from_sps;
                 if !from_sps {
                     let start = r.position();
-                    sh.st_rps = StRps::parse(&mut r, sps.st_rps.len(), &sps.st_rps, sps.st_rps.len())?;
+                    (sh.st_rps, sh.st_rps_ref_delta_pocs) = StRps::parse_with_ref(&mut r, sps.st_rps.len(), &sps.st_rps, sps.st_rps.len())?;
                     sh.st_rps_bits = r.position() - start;
                 } else {
                     ensure!(!sps.st_rps.is_empty(), "no short-term RPS in the SPS");

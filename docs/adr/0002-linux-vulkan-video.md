@@ -1,7 +1,7 @@
 # ADR 0002: Hardware decoding on Linux through Vulkan Video
 
-- **Status:** proposed (2026-10-06). Implemented for H.264; **not yet run on a GPU** (see
-  [Verification](#verification)).
+- **Status:** proposed (2026-10-06). Implemented for H.264 and HEVC (Main, Main 10); **not yet
+  run on a GPU** (see [Verification](#verification) and [Open points](#open-points-for-the-first-gpu-run)).
 - **Issue:** #30 (hardware acceleration)
 - **Builds on:** [ADR 0001](0001-platform-ffi.md) (`unsafe` OS media FFI in `crates/platform` only)
 
@@ -42,54 +42,85 @@ Why Vulkan Video:
 
 ## Design
 
-1. **The front-end is our own decoder.** `filmcraft_h264::accel` runs the software decoder's own
-   NAL handling, slice-header parsing, POC computation, reference marking (sliding window, MMCOs)
-   and DPB output process, but skips pixel reconstruction. Per access unit it emits events:
-   *decode picture P* (active SPS / PPS, `frame_num`, `idr_pic_id`, POCs, reference flags, the
-   slice NAL units, and the DPB pictures P may reference) and *output picture Q* (in the exact
-   order the software decoder outputs, with its pts, crop and colour). Output order, cropping and
-   colour therefore match the software decoder by construction.
+1. **The front-end is our own decoder.** `filmcraft_h264::accel` and `filmcraft_hevc::accel` run
+   the software decoders' own NAL handling, slice-header parsing, POC computation, reference
+   handling (H.264: sliding window and MMCOs; HEVC: reference picture sets, RASL pictures skipped
+   after a CRA where decoding starts) and DPB output process, but skip pixel reconstruction. Per
+   access unit they emit events: *decode picture P* (active parameter sets, POCs, IDR / IRAP and
+   reference flags, H.264 `frame_num` / `idr_pic_id`, HEVC RPS lists and the slice-header RPS bit
+   count, the slice NAL units, and the DPB pictures P may reference) and *output picture Q* (in the
+   exact order the software decoder outputs, with its pts, crop, colour and bit depth). Output
+   order, cropping and colour therefore match the software decoders by construction.
 2. **The backend** (`crates/platform/src/vulkan/`) owns a Vulkan device with a video decode queue,
    one video session per stream, session parameters built from the stream's SPS / PPS, a layered
    DPB image (one array layer per DPB slot), and a host-visible bitstream buffer. For each *decode*
    event it records the reference slots and decodes into the picture's slot; for each *output*
-   event it copies the slot's NV12 planes into a host buffer and then into planar `Yuv8`, cropped
-   to the conformance window.
+   event it copies the slot's NV12 (8-bit) or P010 (10-bit) planes into a host buffer and then into
+   planar `Yuv8` / `Yuv16`, cropped to the conformance window.
 3. **Failure handling.** Every Vulkan call returns a `Result`; a decode error (result-status
    query), a device loss or a fence that does not signal within 2 s is an error, which
    `HybridDecoder` answers by continuing in software (ADR 0001's fallback guarantee).
 4. **First-use verification.** Untested hardware paths must never change a picture. For the first
-   hardware stream of each kind in a process, `HybridDecoder` runs our reference decoder
+   hardware stream of each kind in a process (H.264, HEVC 8-bit, HEVC 10-bit, each with and without
+   quantisation matrices, so a mistake that only shows with one of them cannot hide behind a stream
+   that verified without it), `HybridDecoder` runs our reference decoder
    (single-threaded, so each call returns exactly what the front-end outputs in it) in lockstep,
    compares the first 8 pictures bit for bit and returns the reference's pictures meanwhile. On a
    mismatch it continues with the reference decoder (already in step) and turns that hardware path
    off for the rest of the run (logged, `perf.stats` `decode.hardware.mismatches`).
-5. **Declined streams** (software is used): no `libvulkan`, no device with a video decode queue and
-   H.264 decode support, unsupported profile / level / size, field coding, anything other than
-   8-bit 4:2:0 (the software H.264 decoder's own limits), and streams with `frame_num` gaps
-   (non-existing reference frames).
+5. **Declined streams** (software is used): no `libvulkan`, no device with a video decode queue for
+   the codec, unsupported profile / level / size, H.264 field coding or anything other than 8-bit
+   4:2:0 (the software H.264 decoder's own limits), HEVC other than Main / Main 10 4:2:0 (range
+   extensions, screen content; only the base layer of multi-layer streams is decoded, as in
+   software), parameter sets of different picture sizes in one record, and pictures with missing
+   references (H.264 `frame_num` gaps, an HEVC RPS naming a picture that is not there).
 
 ## Verification
 
 | What | Where | Status (2026-10-06) |
 |---|---|---|
 | Front-end against the software decoder on every libx264 fixture: same outputs (order, pts, POC, crop, colour, aspect), the same outputs per call as a single-threaded decoder, decode-before-output, DPB slot simulation with `max_dpb_frames + 1` slots (`crates/h264/tests/accel.rs`) | every machine | passes |
+| HEVC front-end against the software decoder on every libx265 fixture (open GOPs, Main 10, slices, odd sizes): the same outputs per call as a single-threaded decoder (pts, POC, key flag, crop, colour, aspect, bit depth), RPS lists and DPB lists naming only decoded pictures still held, slot simulation with `sps_max_dec_pic_buffering + 1` slots; hostile input (`crates/hevc/tests/accel.rs`) | every machine | passes |
 | Std SPS / PPS / picture structures field by field against `ffmpeg -bsf:v trace_headers` on three libx264 streams (`crates/platform/src/vulkan/h264.rs`) | Linux | passes |
-| No Vulkan Video device (Mesa lavapipe): the probe declines cleanly, H.264 goes to software, counted (`tests/vulkan_video.rs`) | Linux | passes |
+| Std VPS / SPS / PPS, scaling lists (DC values included) and per-picture structures (POC, IRAP / IDR, RPS bit count, RPS lists in bitstream order as slots) against `ffmpeg -bsf:v trace_headers` on three libx265 streams (`crates/platform/src/vulkan/h265.rs`); a wrong DC convention, RPS bit count or list order fails it | Linux | passes |
+| No Vulkan Video device (Mesa lavapipe): the probe declines cleanly, H.264 and HEVC go to software, counted; each kind of stream has its own verification key (`tests/vulkan_video.rs`) | Linux | passes |
 | First-use verification with stand-in decoders (`tests/verify.rs`) | every machine | passes |
-| Bit-exact parity with the software decoder on five H.264 fixtures, seeks, flush, forced failures, factory verification, damaged input (`tests/vulkan_video.rs`) | Linux with a Vulkan Video driver | **not run yet** |
+| Bit-exact parity with the software decoders on eleven fixtures (five H.264, six HEVC including Main 10, open GOPs, slices, scaling lists, 1080p), seeks, flush, forced failures, factory verification per kind, damaged input (`tests/vulkan_video.rs`) | Linux with a Vulkan Video driver | **not run yet** |
 | Benchmark (`cargo xtask bench --hw off` / `--hw auto`) | same | **not run yet** |
 
 Until the GPU rows pass, first-use verification is what keeps a wrong picture from reaching
 the user: the first stream's first pictures are compared with our decoder, and on any difference
 hardware decoding stays off for that run.
 
+### Open points for the first GPU run
+
+The Vulkan specification leaves some conventions to the reader; these are the choices made, each
+covered by the GPU tests (a wrong one shows as a parity failure, and in the app as a verification
+mismatch that keeps that kind of stream in software):
+
+- **Bitstream layout.** Each slice NAL unit is copied after an Annex B start code (`00 00 01`)
+  and the slice offsets point at the start code (H.264 and HEVC). The specification only says the
+  offsets "correspond to each slice header".
+- **HEVC scaling-list DC values** are passed as the DC coefficients themselves
+  (`scaling_list_dc_coef_minus8 + 8`): the fields are unsigned and named for the coefficient,
+  although the text says they "correspond to `scaling_list_dc_coef_minus8`". Default lists are
+  left to the driver (`sps_scaling_list_data_present_flag` as coded), so only streams that code
+  their own lists depend on this; they are verified separately.
+- **`NumDeltaPocsOfRefRpsIdx`** is `NumDeltaPocs[RefRpsIdx]` of an inter-predicted RPS coded in
+  the slice header and 0 otherwise, the only case where H.265 uses the value; the specification's
+  sentence names `short_term_ref_pic_set_sps_flag` equal to 1. libx265 never predicts a slice-header
+  RPS, so the parity fixtures do not exercise it.
+- **HEVC `IsReference`** is set for every picture: H.265 marks every decoded picture "used for
+  short-term reference" (8.1.3); later reference picture sets unmark it.
+- **Copy-out.** The DPB images are created with `TRANSFER_SRC` usage and decode output coincides
+  with the DPB slot. A driver that offers neither is declined, and the stream decodes in software.
+
 ## Consequences
 
 - Linux gets the same fallback guarantee as macOS: a stream is either decoded bit-exactly on the
   GPU or decoded by our own decoder.
 - The front-end refactor is reusable: VA-API, Windows D3D11 video decoding and Vulkan Video for
-  HEVC / AV1 take the same per-picture information.
+  AV1 / VP9 take the same per-picture information.
 - First version copies pictures back to system memory (12 MB per 4K frame). Zero-copy into wgpu is
   a follow-up, shared with VideoToolbox.
 

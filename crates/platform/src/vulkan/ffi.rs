@@ -19,9 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ash::vk;
-use ash::vk::native::{StdVideoDecodeH264PictureInfo, StdVideoDecodeH264ReferenceInfo, StdVideoH264LevelIdc, StdVideoH264ProfileIdc};
+use ash::vk::native::{
+    StdVideoDecodeH264PictureInfo, StdVideoDecodeH264ReferenceInfo, StdVideoDecodeH265PictureInfo, StdVideoDecodeH265ReferenceInfo, StdVideoH264ProfileIdc,
+    StdVideoH265ProfileIdc,
+};
 
-use super::h264::{ParameterSets, STD_HEADER_NAME, STD_HEADER_VERSION};
+use super::{h264, h265};
 
 pub(crate) type R<T> = Result<T, String>;
 
@@ -50,7 +53,8 @@ struct Family {
 }
 
 /// The decode device: a Vulkan instance and logical device with a video decode queue that takes
-/// H.264, and a transfer-capable queue for read-back (the same queue when it can copy).
+/// H.264 and / or HEVC, and a transfer-capable queue for read-back (the same queue when it can
+/// copy).
 pub(crate) struct Device {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -66,12 +70,24 @@ pub(crate) struct Device {
     copy_queue: Option<Mutex<vk::Queue>>,
     mem: vk::PhysicalDeviceMemoryProperties,
     status_queries: bool,
+    /// The codecs the decode queue takes (with their extensions enabled).
+    codecs: vk::VideoCodecOperationFlagsKHR,
     pub(crate) name: String,
     lost: AtomicBool,
 }
 
 /// Device extensions the backend needs.
-const EXTENSIONS: [&CStr; 3] = [ash::khr::video_queue::NAME, ash::khr::video_decode_queue::NAME, ash::khr::video_decode_h264::NAME];
+const EXTENSIONS: [&CStr; 2] = [ash::khr::video_queue::NAME, ash::khr::video_decode_queue::NAME];
+
+/// The codecs the backend decodes and their extensions (at least one is needed).
+const CODECS: [(vk::VideoCodecOperationFlagsKHR, &CStr); 2] = [
+    (vk::VideoCodecOperationFlagsKHR::DECODE_H264, ash::khr::video_decode_h264::NAME),
+    (vk::VideoCodecOperationFlagsKHR::DECODE_H265, ash::khr::video_decode_h265::NAME),
+];
+
+fn any_codec() -> vk::VideoCodecOperationFlagsKHR {
+    CODECS.iter().fold(vk::VideoCodecOperationFlagsKHR::empty(), |a, (c, _)| a | *c)
+}
 
 /// Device-level functions called through pointers (checked before use).
 const DEVICE_FNS: [&CStr; 13] = [
@@ -118,8 +134,17 @@ fn queue_families(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> Vec<(vk
         .collect()
 }
 
-/// A physical device that can decode H.264: (score, decode family, copy family, status queries).
-fn suitable(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> R<(u32, u32, u32, bool)> {
+/// What makes a physical device usable.
+struct Suitable {
+    score: u32,
+    decode_family: u32,
+    copy_family: u32,
+    status_queries: bool,
+    codecs: vk::VideoCodecOperationFlagsKHR,
+}
+
+/// A physical device that can decode H.264 or HEVC, or why not.
+fn suitable(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> R<Suitable> {
     // SAFETY: `pdev` was enumerated from this live instance.
     let props = unsafe { instance.get_physical_device_properties(pdev) };
     if props.api_version < vk::API_VERSION_1_3 {
@@ -131,21 +156,32 @@ fn suitable(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> R<(u32, u32, 
         vk::PhysicalDeviceType::VIRTUAL_GPU => 1,
         _ => return Err("not a GPU".into()),
     };
-    let fams = queue_families(instance, pdev);
-    let decode = fams
-        .iter()
-        .position(|(_, f)| f.flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR) && f.codecs.contains(vk::VideoCodecOperationFlagsKHR::DECODE_H264))
-        .ok_or("no video decode queue for H.264")?;
-    let can_copy = |f: &Family| f.flags.intersects(vk::QueueFlags::TRANSFER | vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE);
-    let copy =
-        if fams.get(decode).is_some_and(|(_, f)| can_copy(f)) { decode } else { fams.iter().position(|(_, f)| can_copy(f)).ok_or("no transfer queue")? };
     // SAFETY: `pdev` was enumerated from this live instance.
     let exts = unsafe { instance.enumerate_device_extension_properties(pdev) }.map_err(vk_err("vkEnumerateDeviceExtensionProperties"))?;
+    let has = |want: &CStr| exts.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == want));
     for want in EXTENSIONS {
-        if !exts.iter().any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == want)) {
+        if !has(want) {
             return Err(format!("no {}", want.to_string_lossy()));
         }
     }
+    let usable = CODECS.iter().filter(|(_, ext)| has(ext)).fold(vk::VideoCodecOperationFlagsKHR::empty(), |a, (c, _)| a | *c);
+    if usable.is_empty() {
+        return Err("no H.264 or HEVC decode extension".into());
+    }
+    // the video queue structures are only queried once the device has the extension
+    let fams = queue_families(instance, pdev);
+    // the decode family taking the most of our codecs
+    let decode = fams
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, f))| f.flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR) && f.codecs.intersects(usable))
+        .max_by_key(|(_, (_, f))| (f.codecs & usable).as_raw().count_ones())
+        .map(|(i, _)| i)
+        .ok_or("no video decode queue for H.264 or HEVC")?;
+    let codecs = fams.get(decode).map(|(_, f)| f.codecs & usable & any_codec()).unwrap_or_default();
+    let can_copy = |f: &Family| f.flags.intersects(vk::QueueFlags::TRANSFER | vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE);
+    let copy =
+        if fams.get(decode).is_some_and(|(_, f)| can_copy(f)) { decode } else { fams.iter().position(|(_, f)| can_copy(f)).ok_or("no transfer queue")? };
     let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
     let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
     {
@@ -156,13 +192,13 @@ fn suitable(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> R<(u32, u32, 
     if f12.timeline_semaphore != vk::TRUE || f13.synchronization2 != vk::TRUE {
         return Err("no timeline semaphores / synchronization2".into());
     }
-    let status = fams.get(decode).is_some_and(|(_, f)| f.status_queries);
+    let status_queries = fams.get(decode).is_some_and(|(_, f)| f.status_queries);
     let as_u32 = |i: usize| u32::try_from(i).map_err(|_| "queue family index overflows".to_string());
-    Ok((score, as_u32(decode)?, as_u32(copy)?, status))
+    Ok(Suitable { score: score * 4 + codecs.as_raw().count_ones(), decode_family: as_u32(decode)?, copy_family: as_u32(copy)?, status_queries, codecs })
 }
 
 impl Device {
-    /// Open the best GPU that decodes H.264 through Vulkan Video, or say why there is none.
+    /// Open the best GPU that decodes H.264 or HEVC through Vulkan Video, or say why there is none.
     pub(crate) fn open() -> R<Device> {
         // SAFETY: see `loader_available`; the `Entry` is kept in the returned `Device`, so the
         // library stays loaded while any handle created from it exists.
@@ -195,24 +231,25 @@ impl Device {
         }
         // SAFETY: the instance is live.
         let pdevs = unsafe { instance.enumerate_physical_devices() }.map_err(vk_err("vkEnumeratePhysicalDevices"))?;
-        let mut best: Option<(u32, vk::PhysicalDevice, u32, u32, bool)> = None;
+        let mut best: Option<(Suitable, vk::PhysicalDevice)> = None;
         let mut why = Vec::new();
         for pdev in pdevs {
             match suitable(instance, pdev) {
-                Ok((score, d, c, s)) if best.is_none_or(|b| score > b.0) => best = Some((score, pdev, d, c, s)),
+                Ok(s) if best.as_ref().is_none_or(|b| s.score > b.0.score) => best = Some((s, pdev)),
                 Ok(_) => {}
                 Err(e) => why.push(e),
             }
         }
-        let Some((_, pdev, decode_family, copy_family, status_queries)) = best else {
-            return Err(if why.is_empty() { "no GPU".to_string() } else { format!("no GPU decodes H.264 through Vulkan Video ({})", why.join("; ")) });
+        let Some((Suitable { decode_family, copy_family, status_queries, codecs, .. }, pdev)) = best else {
+            return Err(if why.is_empty() { "no GPU".to_string() } else { format!("no GPU decodes H.264 or HEVC through Vulkan Video ({})", why.join("; ")) });
         };
         let prio = [1.0f32];
         let mut queues = vec![vk::DeviceQueueCreateInfo::default().queue_family_index(decode_family).queue_priorities(&prio)];
         if copy_family != decode_family {
             queues.push(vk::DeviceQueueCreateInfo::default().queue_family_index(copy_family).queue_priorities(&prio));
         }
-        let ext_names: Vec<*const c_char> = EXTENSIONS.iter().map(|n| n.as_ptr()).collect();
+        let ext_names: Vec<*const c_char> =
+            EXTENSIONS.iter().map(|n| n.as_ptr()).chain(CODECS.iter().filter(|(c, _)| codecs.contains(*c)).map(|(_, n)| n.as_ptr())).collect();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
         let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&ext_names).push_next(&mut f12).push_next(&mut f13);
@@ -236,7 +273,7 @@ impl Device {
         // SAFETY: as above.
         let mem = unsafe { instance.get_physical_device_memory_properties(pdev) };
         let name = props.device_name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|_| "GPU".into());
-        Ok(OpenedDevice { pdev, device, decode_family, copy_family, decode_queue, copy_queue, mem, status_queries, name })
+        Ok(OpenedDevice { pdev, device, decode_family, copy_family, decode_queue, copy_queue, mem, status_queries, codecs, name })
     }
 
     fn assemble(entry: ash::Entry, instance: ash::Instance, d: OpenedDevice) -> Device {
@@ -257,6 +294,7 @@ impl Device {
             copy_queue: d.copy_queue.map(Mutex::new),
             mem: d.mem,
             status_queries: d.status_queries,
+            codecs: d.codecs,
             name: d.name,
             lost: AtomicBool::new(false),
         }
@@ -265,6 +303,21 @@ impl Device {
     /// Whether the device was lost (every session fails; new ones are declined).
     pub(crate) fn is_lost(&self) -> bool {
         self.lost.load(Ordering::Relaxed)
+    }
+
+    /// Which of H.264 / HEVC the device decodes.
+    pub(crate) fn decodes(&self, codec: &Codec) -> bool {
+        self.codecs.contains(codec.operation())
+    }
+
+    /// The codecs the device decodes, for logs and `probe` ("H.264 and HEVC").
+    pub(crate) fn codec_names(&self) -> String {
+        let names: Vec<&str> = [(vk::VideoCodecOperationFlagsKHR::DECODE_H264, "H.264"), (vk::VideoCodecOperationFlagsKHR::DECODE_H265, "HEVC")]
+            .into_iter()
+            .filter(|(c, _)| self.codecs.contains(*c))
+            .map(|(_, n)| n)
+            .collect();
+        names.join(" and ")
     }
 
     /// The first memory type in `bits` with all of `want`.
@@ -337,6 +390,7 @@ struct OpenedDevice {
     copy_queue: Option<vk::Queue>,
     mem: vk::PhysicalDeviceMemoryProperties,
     status_queries: bool,
+    codecs: vk::VideoCodecOperationFlagsKHR,
     name: String,
 }
 
@@ -359,28 +413,84 @@ impl Drop for Device {
     }
 }
 
+/// The codec and profile of a session (progressive 4:2:0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Codec {
+    /// 8-bit H.264.
+    H264(StdVideoH264ProfileIdc),
+    /// HEVC at 8 or 10 bits.
+    H265(StdVideoH265ProfileIdc, u32),
+}
+
+impl Codec {
+    fn operation(&self) -> vk::VideoCodecOperationFlagsKHR {
+        match self {
+            Codec::H264(_) => vk::VideoCodecOperationFlagsKHR::DECODE_H264,
+            Codec::H265(..) => vk::VideoCodecOperationFlagsKHR::DECODE_H265,
+        }
+    }
+    fn bit_depth(&self) -> u32 {
+        match self {
+            Codec::H264(_) => 8,
+            Codec::H265(_, d) => *d,
+        }
+    }
+    /// The decoded picture format: NV12, or P010 (10 bits in the high bits of 16).
+    fn format(&self) -> vk::Format {
+        if self.bit_depth() > 8 { vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 } else { vk::Format::G8_B8R8_2PLANE_420_UNORM }
+    }
+    fn std_header(&self) -> (&'static CStr, u32) {
+        match self {
+            Codec::H264(_) => (h264::STD_HEADER_NAME, h264::STD_HEADER_VERSION),
+            Codec::H265(..) => (h265::STD_HEADER_NAME, h265::STD_HEADER_VERSION),
+        }
+    }
+}
+
 /// What a stream's session needs.
 pub(crate) struct SessionSpec {
-    pub(crate) profile: StdVideoH264ProfileIdc,
-    pub(crate) level: StdVideoH264LevelIdc,
-    /// Coded picture size in luma samples (multiples of 16).
+    pub(crate) codec: Codec,
+    /// The std level (`StdVideoH264LevelIdc` / `StdVideoH265LevelIdc`).
+    pub(crate) level: u32,
+    /// Coded picture size in luma samples (multiples of the minimum block size).
     pub(crate) coded: (u32, u32),
-    /// DPB slots needed (`max_dpb_frames + 1`).
+    /// DPB slots needed (the DPB size + 1).
     pub(crate) slots: u32,
-    /// Reference pictures a picture may use (`max_num_ref_frames`).
+    /// Reference pictures a picture may use.
     pub(crate) max_refs: u32,
+}
+
+/// A stream's std parameter sets.
+#[derive(Clone, Copy)]
+pub(crate) enum Params<'a> {
+    H264(&'a h264::ParameterSets),
+    H265(&'a h265::ParameterSets),
+}
+
+/// A picture's std decode info.
+#[derive(Clone, Copy)]
+pub(crate) enum PictureInfo {
+    H264(StdVideoDecodeH264PictureInfo),
+    H265(StdVideoDecodeH265PictureInfo),
+}
+
+/// A DPB slot's std reference info.
+#[derive(Clone, Copy)]
+pub(crate) enum RefInfo {
+    H264(StdVideoDecodeH264ReferenceInfo),
+    H265(StdVideoDecodeH265ReferenceInfo),
 }
 
 /// One picture to decode, in the session's terms.
 pub(crate) struct DecodeJob<'a> {
-    /// Slice NAL units, each after a start code.
+    /// Slice (segment) NAL units, each after a start code.
     pub(crate) bitstream: &'a [u8],
     pub(crate) slice_offsets: &'a [u32],
-    pub(crate) picture: StdVideoDecodeH264PictureInfo,
+    pub(crate) picture: PictureInfo,
     /// DPB slot the picture is decoded into, and how it is stored for reference.
-    pub(crate) setup: (u32, StdVideoDecodeH264ReferenceInfo),
+    pub(crate) setup: (u32, RefInfo),
     /// Reference pictures: their slots and reference info.
-    pub(crate) refs: &'a [(u32, StdVideoDecodeH264ReferenceInfo)],
+    pub(crate) refs: &'a [(u32, RefInfo)],
     /// First decode after creation or a seek: reset the session's DPB state.
     pub(crate) reset: bool,
 }
@@ -403,7 +513,7 @@ impl HostBuffer {
 /// the timeline semaphore and an optional decode-status query.
 pub(crate) struct Session {
     dev: Arc<Device>,
-    profile: StdVideoH264ProfileIdc,
+    codec: Codec,
     session: vk::VideoSessionKHR,
     session_memory: Vec<vk::DeviceMemory>,
     params: vk::VideoSessionParametersKHR,
@@ -435,16 +545,25 @@ pub(crate) struct Session {
 // pointers are only dereferenced through `&mut self` while the GPU does not use the buffers.
 unsafe impl Send for Session {}
 
-/// Run `f` with the stream's video profile (progressive 8-bit 4:2:0 H.264).
-fn with_profile<T>(idc: StdVideoH264ProfileIdc, f: impl FnOnce(&vk::VideoProfileInfoKHR<'_>) -> T) -> T {
-    let mut h264 = vk::VideoDecodeH264ProfileInfoKHR::default().std_profile_idc(idc).picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
-    let profile = vk::VideoProfileInfoKHR::default()
-        .video_codec_operation(vk::VideoCodecOperationFlagsKHR::DECODE_H264)
+/// Run `f` with the stream's video profile (progressive 4:2:0).
+fn with_profile<T>(codec: Codec, f: impl FnOnce(&vk::VideoProfileInfoKHR<'_>) -> T) -> T {
+    let depth = if codec.bit_depth() > 8 { vk::VideoComponentBitDepthFlagsKHR::TYPE_10 } else { vk::VideoComponentBitDepthFlagsKHR::TYPE_8 };
+    let base = vk::VideoProfileInfoKHR::default()
+        .video_codec_operation(codec.operation())
         .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-        .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-        .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-        .push_next(&mut h264);
-    f(&profile)
+        .luma_bit_depth(depth)
+        .chroma_bit_depth(depth);
+    match codec {
+        Codec::H264(idc) => {
+            let mut h264 =
+                vk::VideoDecodeH264ProfileInfoKHR::default().std_profile_idc(idc).picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
+            f(&base.push_next(&mut h264))
+        }
+        Codec::H265(idc, _) => {
+            let mut h265 = vk::VideoDecodeH265ProfileInfoKHR::default().std_profile_idc(idc);
+            f(&base.push_next(&mut h265))
+        }
+    }
 }
 
 /// What the driver reports for a profile.
@@ -457,19 +576,24 @@ struct Caps {
     max_extent: vk::Extent2D,
     max_slots: u32,
     max_refs: u32,
-    max_level: StdVideoH264LevelIdc,
+    max_level: u32,
     header: vk::ExtensionProperties,
 }
 
-fn capabilities(dev: &Device, profile: &vk::VideoProfileInfoKHR<'_>) -> R<Caps> {
+fn capabilities(dev: &Device, profile: &vk::VideoProfileInfoKHR<'_>, codec: Codec) -> R<Caps> {
     let mut h264 = vk::VideoDecodeH264CapabilitiesKHR::default();
+    let mut h265 = vk::VideoDecodeH265CapabilitiesKHR::default();
     let mut decode = vk::VideoDecodeCapabilitiesKHR::default();
-    let mut caps = vk::VideoCapabilitiesKHR::default().push_next(&mut decode).push_next(&mut h264);
+    let mut caps = vk::VideoCapabilitiesKHR::default().push_next(&mut decode);
+    caps = match codec {
+        Codec::H264(_) => caps.push_next(&mut h264),
+        Codec::H265(..) => caps.push_next(&mut h265),
+    };
     // SAFETY: the function pointer was checked at device creation; the profile chain and the
     // capability chain point at live locals for the duration of the call.
     let r = unsafe { (dev.video_instance.fp().get_physical_device_video_capabilities_khr)(dev.pdev, profile, &mut caps) };
     if r != vk::Result::SUCCESS {
-        return Err(format!("H.264 profile not supported for decoding ({r})"));
+        return Err(format!("profile not supported for decoding ({r})"));
     }
     let c = Caps {
         decode_flags: vk::VideoDecodeCapabilityFlagsKHR::empty(),
@@ -483,11 +607,20 @@ fn capabilities(dev: &Device, profile: &vk::VideoProfileInfoKHR<'_>) -> R<Caps> 
         max_level: 0,
         header: caps.std_header_version,
     };
-    Ok(Caps { decode_flags: decode.flags, max_level: h264.max_level_idc, ..c })
+    let max_level = match codec {
+        Codec::H264(_) => h264.max_level_idc,
+        Codec::H265(..) => h265.max_level_idc,
+    };
+    Ok(Caps { decode_flags: decode.flags, max_level, ..c })
 }
 
-/// The NV12 format the driver offers for `usage` with this profile, with its image parameters.
-fn video_format(dev: &Device, profile: &vk::VideoProfileInfoKHR<'_>, usage: vk::ImageUsageFlags) -> R<Option<(vk::ImageCreateFlags, vk::ImageTiling)>> {
+/// The image parameters the driver gives `format` for `usage` with this profile, if it offers it.
+fn video_format(
+    dev: &Device,
+    profile: &vk::VideoProfileInfoKHR<'_>,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> R<Option<(vk::ImageCreateFlags, vk::ImageTiling)>> {
     let profiles = [*profile];
     let mut list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
     let info = vk::PhysicalDeviceVideoFormatInfoKHR::default().image_usage(usage).push_next(&mut list);
@@ -509,10 +642,7 @@ fn video_format(dev: &Device, profile: &vk::VideoProfileInfoKHR<'_>, usage: vk::
         return Err(format!("vkGetPhysicalDeviceVideoFormatPropertiesKHR: {r}"));
     }
     props.truncate(n as usize);
-    Ok(props
-        .iter()
-        .find(|p| p.format == vk::Format::G8_B8R8_2PLANE_420_UNORM && p.image_usage_flags.contains(usage))
-        .map(|p| (p.image_create_flags, p.image_tiling)))
+    Ok(props.iter().find(|p| p.format == format && p.image_usage_flags.contains(usage)).map(|p| (p.image_create_flags, p.image_tiling)))
 }
 
 fn align_up(v: u64, a: u64) -> Option<u64> {
@@ -522,17 +652,20 @@ fn align_up(v: u64, a: u64) -> Option<u64> {
 
 impl Session {
     /// A session for a stream, or why the GPU cannot decode it.
-    pub(crate) fn new(dev: Arc<Device>, spec: &SessionSpec, sets: &ParameterSets) -> R<Session> {
+    pub(crate) fn new(dev: Arc<Device>, spec: &SessionSpec, params: Params<'_>) -> R<Session> {
         if dev.is_lost() {
             return Err("the GPU was lost".into());
         }
+        if !dev.decodes(&spec.codec) {
+            return Err(format!("{} does not decode this codec through Vulkan Video", dev.name));
+        }
         let mut s = Session {
             dev: dev.clone(),
-            profile: spec.profile,
+            codec: spec.codec,
             session: vk::VideoSessionKHR::null(),
             session_memory: Vec::new(),
             params: vk::VideoSessionParametersKHR::null(),
-            format: vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            format: spec.codec.format(),
             extent: vk::Extent2D::default(),
             coded: vk::Extent2D { width: spec.coded.0, height: spec.coded.1 },
             image: vk::Image::null(),
@@ -552,13 +685,13 @@ impl Session {
             hung: false,
         };
         // On an error `s` is dropped, which destroys whatever was created so far.
-        with_profile(spec.profile, |profile| s.create(profile, spec, sets))?;
+        with_profile(spec.codec, |profile| s.create(profile, spec, params))?;
         Ok(s)
     }
 
-    fn create(&mut self, profile: &vk::VideoProfileInfoKHR<'_>, spec: &SessionSpec, sets: &ParameterSets) -> R<()> {
+    fn create(&mut self, profile: &vk::VideoProfileInfoKHR<'_>, spec: &SessionSpec, params: Params<'_>) -> R<()> {
         let dev = self.dev.clone();
-        let caps = capabilities(&dev, profile)?;
+        let caps = capabilities(&dev, profile, spec.codec)?;
         let (w, h) = spec.coded;
         if w < caps.min_extent.width || h < caps.min_extent.height || w > caps.max_extent.width || h > caps.max_extent.height {
             return Err(format!(
@@ -572,14 +705,15 @@ impl Session {
         if spec.slots > caps.max_slots || spec.max_refs > caps.max_refs || spec.slots < 2 {
             return Err(format!("needs {} DPB slots / {} references, the decoder has {} / {}", spec.slots, spec.max_refs, caps.max_slots, caps.max_refs));
         }
-        if caps.header.extension_name_as_c_str().ok() != Some(STD_HEADER_NAME) || caps.header.spec_version < STD_HEADER_VERSION {
-            return Err("unexpected H.264 std header from the driver".into());
+        let (header, version) = spec.codec.std_header();
+        if caps.header.extension_name_as_c_str().ok() != Some(header) || caps.header.spec_version < version {
+            return Err("unexpected std header from the driver".into());
         }
         if !caps.decode_flags.contains(vk::VideoDecodeCapabilityFlagsKHR::DPB_AND_OUTPUT_COINCIDE) {
             return Err("decode output separate from the DPB is not supported yet".into());
         }
         let usage = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR | vk::ImageUsageFlags::TRANSFER_SRC;
-        let (create_flags, tiling) = video_format(&dev, profile, usage)?.ok_or("no NV12 decode format that can be copied out")?;
+        let (create_flags, tiling) = video_format(&dev, profile, self.format, usage)?.ok_or("no NV12 / P010 decode format that can be copied out")?;
         let gw = caps.granularity.width.max(1);
         let gh = caps.granularity.height.max(1);
         self.extent = vk::Extent2D { width: w.div_ceil(gw).saturating_mul(gw), height: h.div_ceil(gh).saturating_mul(gh) };
@@ -592,7 +726,7 @@ impl Session {
         }
         self.bitstream_align = (caps.offset_align, caps.size_align);
         self.create_session(profile, spec, &caps)?;
-        self.create_parameters(sets)?;
+        self.create_parameters(params)?;
         self.create_image(profile, spec.slots, create_flags, tiling, usage)?;
         let bits = align_up(u64::from(w) * u64::from(h), caps.size_align).ok_or("bitstream size overflows")?.max(1 << 20);
         self.bitstream = self.host_buffer(
@@ -601,7 +735,7 @@ impl Session {
             Some(profile),
             &[vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT, vk::MemoryPropertyFlags::HOST_VISIBLE],
         )?;
-        let frame = u64::from(self.extent.width) * u64::from(self.extent.height) * 3 / 2;
+        let frame = u64::from(self.extent.width) * u64::from(self.extent.height) * 3 / 2 * self.bytes_per_sample();
         self.readback = self.host_buffer(
             frame,
             vk::BufferUsageFlags::TRANSFER_DST,
@@ -629,10 +763,8 @@ impl Session {
 
     fn create_session(&mut self, profile: &vk::VideoProfileInfoKHR<'_>, spec: &SessionSpec, caps: &Caps) -> R<()> {
         let dev = self.dev.clone();
-        let header = vk::ExtensionProperties::default()
-            .extension_name(STD_HEADER_NAME)
-            .map_err(|_| "std header name too long".to_string())?
-            .spec_version(STD_HEADER_VERSION);
+        let (name, version) = spec.codec.std_header();
+        let header = vk::ExtensionProperties::default().extension_name(name).map_err(|_| "std header name too long".to_string())?.spec_version(version);
         let max_refs = spec.max_refs.max(1).min(caps.max_refs);
         let info = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(dev.decode_family)
@@ -687,17 +819,35 @@ impl Session {
         Ok(())
     }
 
-    fn create_parameters(&mut self, sets: &ParameterSets) -> R<()> {
+    fn create_parameters(&mut self, params: Params<'_>) -> R<()> {
         let dev = self.dev.clone();
         let count = |n: usize| u32::try_from(n).map_err(|_| "too many parameter sets".to_string());
-        let add = vk::VideoDecodeH264SessionParametersAddInfoKHR::default().std_sp_ss(&sets.sps).std_pp_ss(&sets.pps);
-        let mut h264 = vk::VideoDecodeH264SessionParametersCreateInfoKHR::default()
-            .max_std_sps_count(count(sets.sps.len())?)
-            .max_std_pps_count(count(sets.pps.len())?)
-            .parameters_add_info(&add);
-        let info = vk::VideoSessionParametersCreateInfoKHR::default().video_session(self.session).push_next(&mut h264);
+        let h264_add;
+        let h265_add;
+        let mut h264;
+        let mut h265;
+        let mut info = vk::VideoSessionParametersCreateInfoKHR::default().video_session(self.session);
+        match params {
+            Params::H264(sets) => {
+                h264_add = vk::VideoDecodeH264SessionParametersAddInfoKHR::default().std_sp_ss(&sets.sps).std_pp_ss(&sets.pps);
+                h264 = vk::VideoDecodeH264SessionParametersCreateInfoKHR::default()
+                    .max_std_sps_count(count(sets.sps.len())?)
+                    .max_std_pps_count(count(sets.pps.len())?)
+                    .parameters_add_info(&h264_add);
+                info = info.push_next(&mut h264);
+            }
+            Params::H265(sets) => {
+                h265_add = vk::VideoDecodeH265SessionParametersAddInfoKHR::default().std_vp_ss(&sets.vps).std_sp_ss(&sets.sps).std_pp_ss(&sets.pps);
+                h265 = vk::VideoDecodeH265SessionParametersCreateInfoKHR::default()
+                    .max_std_vps_count(count(sets.vps.len())?)
+                    .max_std_sps_count(count(sets.sps.len())?)
+                    .max_std_pps_count(count(sets.pps.len())?)
+                    .parameters_add_info(&h265_add);
+                info = info.push_next(&mut h265);
+            }
+        }
         // SAFETY: function pointer checked at device creation; the std structures and the storage
-        // their pointers point into (`sets`) outlive the call; the driver copies what it keeps.
+        // their pointers point into (`params`) outlive the call; the driver copies what it keeps.
         let r = unsafe { (dev.video.fp().create_video_session_parameters_khr)(dev.device.handle(), &info, std::ptr::null(), &mut self.params) };
         if r != vk::Result::SUCCESS {
             self.params = vk::VideoSessionParametersKHR::null();
@@ -821,6 +971,11 @@ impl Session {
         (self.extent.width, self.extent.height)
     }
 
+    /// Bytes per copied-out sample: 1 (NV12) or 2 (P010).
+    pub(crate) fn bytes_per_sample(&self) -> u64 {
+        if self.codec.bit_depth() > 8 { 2 } else { 1 }
+    }
+
     fn check(&self) -> R<()> {
         if self.hung || self.dev.is_lost() {
             return Err("the hardware decoder stopped responding".into());
@@ -856,7 +1011,7 @@ impl Session {
             return Err(format!("picture bitstream of {size} bytes"));
         }
         let want = align_up(size.saturating_mul(2).min(MAX_BITSTREAM), self.bitstream_align.1).ok_or("bitstream size overflows")?;
-        let buffer = with_profile(self.profile, |profile| {
+        let buffer = with_profile(self.codec, |profile| {
             self.host_buffer(
                 want,
                 vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR,
@@ -881,7 +1036,7 @@ impl Session {
         let range = align_up(len, self.bitstream_align.1).ok_or("bitstream size overflows")?;
         self.reserve_bitstream(range)?;
         let layers = self.layouts.len() as u32;
-        let (setup_layer, setup_info) = job.setup;
+        let setup_layer = job.setup.0;
         if setup_layer >= layers || job.refs.iter().any(|(l, _)| *l >= layers || *l == setup_layer) {
             return Err("DPB slot out of range".into());
         }
@@ -897,6 +1052,53 @@ impl Session {
             unsafe { dev.device.flush_mapped_memory_ranges(&[r]) }.map_err(vk_err("vkFlushMappedMemoryRanges"))?;
         }
 
+        match (job.picture, job.setup.1) {
+            (PictureInfo::H264(pic), RefInfo::H264(setup)) => {
+                let refs = job
+                    .refs
+                    .iter()
+                    .map(|(_, r)| match r {
+                        RefInfo::H264(i) => Ok(*i),
+                        RefInfo::H265(_) => Err("HEVC reference for an H.264 picture".to_string()),
+                    })
+                    .collect::<R<Vec<_>>>()?;
+                let mut ref_dpb: Vec<vk::VideoDecodeH264DpbSlotInfoKHR<'_>> =
+                    refs.iter().map(|i| vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(i)).collect();
+                let mut setup_dpb = vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup);
+                let mut info = vk::VideoDecodeH264PictureInfoKHR::default().std_picture_info(&pic).slice_offsets(job.slice_offsets);
+                self.record_decode(job, range, &mut setup_dpb, &mut ref_dpb, &mut info)
+            }
+            (PictureInfo::H265(pic), RefInfo::H265(setup)) => {
+                let refs = job
+                    .refs
+                    .iter()
+                    .map(|(_, r)| match r {
+                        RefInfo::H265(i) => Ok(*i),
+                        RefInfo::H264(_) => Err("H.264 reference for an HEVC picture".to_string()),
+                    })
+                    .collect::<R<Vec<_>>>()?;
+                let mut ref_dpb: Vec<vk::VideoDecodeH265DpbSlotInfoKHR<'_>> =
+                    refs.iter().map(|i| vk::VideoDecodeH265DpbSlotInfoKHR::default().std_reference_info(i)).collect();
+                let mut setup_dpb = vk::VideoDecodeH265DpbSlotInfoKHR::default().std_reference_info(&setup);
+                let mut info = vk::VideoDecodeH265PictureInfoKHR::default().std_picture_info(&pic).slice_segment_offsets(job.slice_offsets);
+                self.record_decode(job, range, &mut setup_dpb, &mut ref_dpb, &mut info)
+            }
+            _ => Err("picture and reference infos of different codecs".into()),
+        }
+    }
+
+    /// Record, submit and wait for one decode; `setup_dpb` / `ref_dpb` / `info` are the
+    /// codec-specific structures of the setup slot, the reference slots and the picture.
+    fn record_decode<D: vk::ExtendsVideoReferenceSlotInfoKHR, P: vk::ExtendsVideoDecodeInfoKHR>(
+        &mut self,
+        job: &DecodeJob<'_>,
+        range: u64,
+        setup_dpb: &mut D,
+        ref_dpb: &mut [D],
+        info: &mut P,
+    ) -> R<()> {
+        let dev = self.dev.clone();
+        let setup_layer = job.setup.0;
         let resource = |layer: u32| {
             vk::VideoPictureResourceInfoKHR::default()
                 .coded_offset(vk::Offset2D { x: 0, y: 0 })
@@ -906,17 +1108,13 @@ impl Session {
         };
         let setup_res = resource(setup_layer);
         let ref_res: Vec<vk::VideoPictureResourceInfoKHR<'_>> = job.refs.iter().map(|(l, _)| resource(*l)).collect();
-        let ref_std: Vec<StdVideoDecodeH264ReferenceInfo> = job.refs.iter().map(|(_, i)| *i).collect();
-        let mut ref_dpb: Vec<vk::VideoDecodeH264DpbSlotInfoKHR<'_>> =
-            ref_std.iter().map(|i| vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(i)).collect();
         let ref_slots: Vec<vk::VideoReferenceSlotInfoKHR<'_>> = ref_dpb
             .iter_mut()
             .zip(&ref_res)
             .zip(job.refs)
             .map(|((d, r), (layer, _))| vk::VideoReferenceSlotInfoKHR::default().slot_index(*layer as i32).picture_resource(r).push_next(d))
             .collect();
-        let mut setup_dpb = vk::VideoDecodeH264DpbSlotInfoKHR::default().std_reference_info(&setup_info);
-        let setup_slot = vk::VideoReferenceSlotInfoKHR::default().slot_index(setup_layer as i32).picture_resource(&setup_res).push_next(&mut setup_dpb);
+        let setup_slot = vk::VideoReferenceSlotInfoKHR::default().slot_index(setup_layer as i32).picture_resource(&setup_res).push_next(setup_dpb);
         // The coding scope binds the references and, inactive (-1), the slot being set up.
         let mut begin_slots: Vec<vk::VideoReferenceSlotInfoKHR<'_>> = ref_res
             .iter()
@@ -924,8 +1122,6 @@ impl Session {
             .map(|(r, (layer, _))| vk::VideoReferenceSlotInfoKHR::default().slot_index(*layer as i32).picture_resource(r))
             .collect();
         begin_slots.push(vk::VideoReferenceSlotInfoKHR::default().slot_index(-1).picture_resource(&setup_res));
-        let std_pic = job.picture;
-        let mut h264_pic = vk::VideoDecodeH264PictureInfoKHR::default().std_picture_info(&std_pic).slice_offsets(job.slice_offsets);
         let decode = vk::VideoDecodeInfoKHR::default()
             .src_buffer(self.bitstream.buffer)
             .src_buffer_offset(0)
@@ -933,7 +1129,7 @@ impl Session {
             .dst_picture_resource(setup_res)
             .setup_reference_slot(&setup_slot)
             .reference_slots(&ref_slots)
-            .push_next(&mut h264_pic);
+            .push_next(info);
 
         // The slot being set up is overwritten (old contents discarded); references go back to the
         // DPB layout if they were last copied out.
@@ -1042,7 +1238,7 @@ impl Session {
             return Err("DPB slot holds no picture".into());
         }
         let (w, h) = (self.extent.width, self.extent.height);
-        let luma = u64::from(w) * u64::from(h);
+        let luma = u64::from(w) * u64::from(h) * self.bytes_per_sample();
         let size = luma * 3 / 2;
         if size > self.readback.size {
             return Err("read-back buffer too small".into());

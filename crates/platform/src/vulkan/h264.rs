@@ -25,9 +25,6 @@ use filmcraft_h264::params::{Pps, ScalingMatrices, Sps};
 pub(crate) const STD_HEADER_NAME: &std::ffi::CStr = c"VK_STD_vulkan_video_codec_h264_decode";
 pub(crate) const STD_HEADER_VERSION: u32 = 1 << 22;
 
-/// A slice NAL unit's prefix in the bitstream buffer: the decoder takes Annex B start codes.
-const START_CODE: [u8; 3] = [0, 0, 1];
-
 /// Std SPS / PPS structures and the storage their pointers point into.
 pub(crate) struct ParameterSets {
     pub(crate) sps: Vec<StdVideoH264SequenceParameterSet>,
@@ -238,22 +235,10 @@ pub(crate) fn setup_info(p: &DecodePicture) -> Result<StdVideoDecodeH264Referenc
     reference_info(&r)
 }
 
-/// The picture's bitstream: each slice NAL unit after a start code, and where each starts.
-pub(crate) fn bitstream(slices: &[Vec<u8>]) -> Result<(Vec<u8>, Vec<u32>), String> {
-    let len = slices.iter().try_fold(0usize, |a, s| a.checked_add(s.len())?.checked_add(START_CODE.len())).ok_or("bitstream too large")?;
-    let mut data = Vec::with_capacity(len);
-    let mut offsets = Vec::with_capacity(slices.len());
-    for s in slices {
-        offsets.push(u32::try_from(data.len()).map_err(err("slice offset"))?);
-        data.extend_from_slice(&START_CODE);
-        data.extend_from_slice(s);
-    }
-    Ok((data, offsets))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vulkan::trace_headers::{Field, get, trace};
 
     #[test]
     fn levels_and_profiles() {
@@ -261,41 +246,6 @@ mod tests {
         assert_eq!(std_level(9), Ok(StdVideoH264LevelIdc_STD_VIDEO_H264_LEVEL_IDC_1_1));
         assert!(std_level(0).is_err());
         assert!(std_level(63).is_err());
-    }
-
-    /// ffmpeg's `trace_headers` dump of a stream (external oracle): (block title, fields in order).
-    fn trace(ff: &std::path::Path, path: &std::path::Path) -> Vec<(String, Vec<(String, i64)>)> {
-        let out = std::process::Command::new(ff)
-            .args(["-hide_banner", "-loglevel", "info", "-i"])
-            .arg(path)
-            .args(["-c:v", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
-            .output()
-            .unwrap();
-        let text = String::from_utf8_lossy(&out.stderr);
-        let mut blocks: Vec<(String, Vec<(String, i64)>)> = Vec::new();
-        for line in text.lines() {
-            let Some((_, body)) = line.strip_prefix("[trace_headers @ ").and_then(|r| r.split_once("] ")) else { continue };
-            let body = body.trim();
-            let field = body.split_once(" = ").and_then(|(lhs, v)| {
-                let mut t = lhs.split_whitespace();
-                let pos = t.next()?;
-                pos.chars().all(|c| c.is_ascii_digit()).then(|| (t.next().unwrap_or_default().to_string(), v.trim().parse::<i64>().ok()))
-            });
-            match field {
-                Some((name, Some(v))) => {
-                    if let Some(b) = blocks.last_mut() {
-                        b.1.push((name, v));
-                    }
-                }
-                Some((_, None)) => {}
-                None => blocks.push((body.to_string(), Vec::new())),
-            }
-        }
-        blocks
-    }
-
-    fn get(fields: &[(String, i64)], name: &str, absent: i64) -> i64 {
-        fields.iter().find(|(n, _)| n == name).map_or(absent, |(_, v)| *v)
     }
 
     /// The std SPS / PPS and per-picture structures carry what the bitstream says, field by
@@ -328,7 +278,8 @@ mod tests {
             let Some(path) = made else { panic!("{name}: fixture generation failed") };
             let data = std::fs::read(&path).unwrap();
             let blocks = trace(&ff, &path);
-            let block = |title: &str| blocks.iter().find(|b| b.0 == title).map(|b| b.1.clone()).unwrap_or_else(|| panic!("{name}: no {title} in the trace"));
+            let block =
+                |title: &str| blocks.iter().find(|b| b.title == title).map(|b| b.fields.clone()).unwrap_or_else(|| panic!("{name}: no {title} in the trace"));
             let (ts, tp) = (block("Sequence Parameter Set"), block("Picture Parameter Set"));
 
             let mut table: Vec<Option<Sps>> = vec![None; 32];
@@ -418,8 +369,8 @@ mod tests {
             assert_eq!(name == "trace_high_cqm.h264", lists_in_play, "{name}: only the cqm stream has matrices");
 
             // pictures, in decoding order: the trace's first slice of each picture
-            let pictures: Vec<&Vec<(String, i64)>> =
-                blocks.iter().filter(|b| b.0 == "Slice Header" && get(&b.1, "first_mb_in_slice", -1) == 0).map(|b| &b.1).collect();
+            let pictures: Vec<&Vec<Field>> =
+                blocks.iter().filter(|b| b.title == "Slice Header" && get(&b.fields, "first_mb_in_slice", -1) == 0).map(|b| &b.fields).collect();
             let mut fe = filmcraft_h264::accel::Frontend::new();
             let mut events = fe.decode(&data, 0).unwrap();
             events.extend(fe.flush());
@@ -454,13 +405,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn bitstream_puts_a_start_code_before_each_slice() {
-        let (data, offsets) = bitstream(&[vec![0x65, 1, 2], vec![0x41, 3]]).unwrap();
-        assert_eq!(data, [0, 0, 1, 0x65, 1, 2, 0, 0, 1, 0x41, 3]);
-        assert_eq!(offsets, [0, 6]);
-        assert_eq!(bitstream(&[]).unwrap(), (Vec::new(), Vec::new()));
     }
 }

@@ -306,17 +306,29 @@ pub struct HevcDecoder {
     dec: filmcraft_hevc::Decoder,
     length_size: usize,
     highest_tid: Option<u8>,
+    /// Worker threads (0: the decoder's default, every core).
+    threads: usize,
 }
 
 impl HevcDecoder {
     pub fn new(hvcc: Vec<u8>) -> Result<Self> {
-        let dec = filmcraft_hevc::Decoder::from_hvcc(&hvcc).map_err(|e| CodecError::Decode(e.to_string()))?;
+        Self::with_threads(hvcc, 0)
+    }
+    /// A decoder with `threads` worker threads (0: every core). With one thread, every call returns
+    /// exactly the pictures the decoding process outputs in it, as hardware decoders built on
+    /// `filmcraft_hevc::accel` do ([`crate::reference_video_decoder`]).
+    pub fn with_threads(hvcc: Vec<u8>, threads: usize) -> Result<Self> {
+        let mut dec = Self::fresh(threads);
+        dec.configure_hvcc(&hvcc).map_err(|e| CodecError::Decode(e.to_string()))?;
         let (length_size, highest_tid) = hvcc_length_size_and_tid(&hvcc);
-        Ok(Self { hvcc, dec, length_size, highest_tid })
+        Ok(Self { hvcc, dec, length_size, highest_tid, threads })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: TS).
     pub fn annexb() -> Self {
-        Self { hvcc: Vec::new(), dec: filmcraft_hevc::Decoder::new(), length_size: 0, highest_tid: None }
+        Self { hvcc: Vec::new(), dec: filmcraft_hevc::Decoder::new(), length_size: 0, highest_tid: None, threads: 0 }
+    }
+    fn fresh(threads: usize) -> filmcraft_hevc::Decoder {
+        if threads == 0 { filmcraft_hevc::Decoder::new() } else { filmcraft_hevc::Decoder::with_threads(threads) }
     }
     fn convert(p: filmcraft_hevc::Picture) -> DecodedFrame {
         use filmcraft_hevc::Plane;
@@ -359,9 +371,8 @@ impl VideoDecoder for HevcDecoder {
         self.dec.flush().into_iter().map(Self::convert).collect()
     }
     fn reset(&mut self) {
-        if self.hvcc.is_empty() {
-            self.dec = filmcraft_hevc::Decoder::new();
-        } else if let Ok(d) = filmcraft_hevc::Decoder::from_hvcc(&self.hvcc) {
+        let mut d = Self::fresh(self.threads);
+        if self.hvcc.is_empty() || d.configure_hvcc(&self.hvcc).is_ok() {
             self.dec = d;
         }
     }

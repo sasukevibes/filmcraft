@@ -3,8 +3,9 @@
 //! [`register`] puts the platform's hardware decoder factory in front of FilmCraft's own decoders
 //! (`filmcraft_codecs::register_video_decoder`): VideoToolbox on macOS for H.264 (`avcC`) and HEVC
 //! (`hvcC`) streams, 8- and 10-bit, 4:2:0 and 4:2:2; Vulkan Video on Linux for 8-bit 4:2:0
-//! progressive H.264 ([`vulkan`], docs/adr/0002-linux-vulkan-video.md). Elsewhere registration
-//! does nothing and reports [`Availability::Unavailable`].
+//! progressive H.264 and 8- / 10-bit 4:2:0 HEVC (Main, Main 10) ([`vulkan`],
+//! docs/adr/0002-linux-vulkan-video.md). Elsewhere registration does nothing and reports
+//! [`Availability::Unavailable`].
 //!
 //! Hardware decoding never makes a file undecodable:
 //!
@@ -97,7 +98,7 @@ pub fn hardware_decoder_for(entry: &filmcraft_isobmff::SampleEntry) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        vulkan_decoder(entry).is_some_and(|r| r.is_ok())
+        vulkan_stream(entry).is_some_and(|(info, _)| vulkan_decoder(entry, &info).is_ok())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -124,66 +125,97 @@ pub fn videotoolbox_factory(entry: &filmcraft_isobmff::SampleEntry) -> Option<fi
     }
 }
 
-/// The Vulkan Video decoder for an `avcC` stream: `None` for other codecs, an error when the GPU
-/// does not take the stream.
+/// An `avcC` / `hvcC` stream's info and the first-use verification key of its Vulkan Video path;
+/// `None` for other codecs and configuration records that do not parse (the software decoder
+/// reports those).
+#[cfg(target_os = "linux")]
+fn vulkan_stream(entry: &filmcraft_isobmff::SampleEntry) -> Option<(filmcraft_codecs::hw::NalStreamInfo, &'static str)> {
+    use filmcraft_codecs::hw::NalCodec;
+    let info = filmcraft_codecs::hw::NalStreamInfo::from_entry(entry)?.ok()?;
+    let key = match (info.codec, info.bit_depth_luma > 8, vulkan::scaling_in_use(&info)) {
+        (NalCodec::H264, _, false) => VULKAN_H264,
+        (NalCodec::H264, _, true) => VULKAN_H264_MATRICES,
+        (NalCodec::Hevc, false, false) => VULKAN_HEVC,
+        (NalCodec::Hevc, false, true) => VULKAN_HEVC_LISTS,
+        (NalCodec::Hevc, true, false) => VULKAN_HEVC_10,
+        (NalCodec::Hevc, true, true) => VULKAN_HEVC_10_LISTS,
+    };
+    Some((info, key))
+}
+
+/// The first-use verification key of the Vulkan Video path a stream would take (`None`: not an
+/// `avcC` / `hvcC` stream): one per codec, bit depth and use of quantisation matrices, so each
+/// kind is checked against the software decoder on its own and a mistake that only shows with one
+/// of them cannot hide behind a stream that verified without it.
+#[cfg(target_os = "linux")]
+pub fn vulkan_verification_key(entry: &filmcraft_isobmff::SampleEntry) -> Option<&'static str> {
+    vulkan_stream(entry).map(|(_, key)| key)
+}
+
+/// The Vulkan Video decoder for an `avcC` / `hvcC` stream, or why the GPU does not take it.
 #[cfg(target_os = "linux")]
 fn vulkan_decoder(
     entry: &filmcraft_isobmff::SampleEntry,
-) -> Option<std::result::Result<(vulkan::VulkanH264Decoder, filmcraft_codecs::hw::NalStreamInfo), String>> {
-    let filmcraft_isobmff::CodecConfig::Avc(avc) = &entry.codec else { return None };
-    let info = match filmcraft_codecs::hw::NalStreamInfo::from_entry(entry)? {
-        Ok(info) => info,
-        Err(e) => return Some(Err(e.to_string())),
-    };
-    Some(vulkan::VulkanH264Decoder::new(info.clone(), avc.to_bytes()).map(|d| (d, info)))
+    info: &filmcraft_codecs::hw::NalStreamInfo,
+) -> std::result::Result<Box<dyn filmcraft_codecs::VideoDecoder>, String> {
+    match &entry.codec {
+        filmcraft_isobmff::CodecConfig::Avc(c) => Ok(Box::new(vulkan::VulkanH264Decoder::new(info.clone(), c.to_bytes())?)),
+        filmcraft_isobmff::CodecConfig::Hevc(c) => Ok(Box::new(vulkan::VulkanHevcDecoder::new(info.clone(), c.to_bytes())?)),
+        _ => Err("not an H.264 or HEVC stream".into()),
+    }
 }
 
-/// The Vulkan Video factory (Linux): a [`HybridDecoder`] around [`vulkan::VulkanH264Decoder`] for
-/// `avcC` streams the GPU decodes, `None` otherwise. Until one stream has been checked against the
+/// The Vulkan Video factory (Linux): a [`HybridDecoder`] around [`vulkan::VulkanH264Decoder`] /
+/// [`vulkan::VulkanHevcDecoder`] for `avcC` / `hvcC` streams the GPU decodes, `None` otherwise.
+/// Until one stream of a kind (H.264, HEVC 8-bit, HEVC 10-bit) has been checked against the
 /// software decoder in this process, the first pictures are decoded both ways and compared
-/// ([`HybridDecoder::verifying`]); after a mismatch the factory declines for the rest of the run.
+/// ([`HybridDecoder::verifying`]); after a mismatch the factory declines that kind for the rest of
+/// the run.
 #[cfg(target_os = "linux")]
 pub fn vulkan_factory(entry: &filmcraft_isobmff::SampleEntry) -> Option<filmcraft_codecs::Result<Box<dyn filmcraft_codecs::VideoDecoder>>> {
-    if !filmcraft_codecs::hw::hardware_decoding() || !matches!(entry.codec, filmcraft_isobmff::CodecConfig::Avc(_)) {
+    if !filmcraft_codecs::hw::hardware_decoding() {
         return None;
     }
-    let check = match hybrid::verification(VULKAN_H264) {
+    let (info, key) = vulkan_stream(entry)?;
+    let check = match hybrid::verification(key) {
         hybrid::Verification::Verified => None,
-        hybrid::Verification::Claimed => Some(VULKAN_H264),
+        hybrid::Verification::Claimed => Some(key),
         hybrid::Verification::Busy | hybrid::Verification::Failed => return None,
     };
-    let Some(made) = vulkan_decoder(entry) else {
-        if let Some(key) = check {
-            hybrid::release(key);
-        }
-        return None;
-    };
-    match made {
-        Ok((d, info)) => {
-            let hybrid = match check {
-                Some(key) => HybridDecoder::verifying(Box::new(d), entry.clone(), info, key),
-                None => Ok(HybridDecoder::new(Box::new(d), entry.clone(), info)),
-            };
-            match hybrid {
-                Ok(h) => Some(Ok(Box::new(h))),
-                Err(e) => {
-                    log::info!("hardware decoding declined for H.264 video: {e}");
-                    filmcraft_codecs::hw::note_hw_declined();
-                    None
-                }
-            }
-        }
+    let made = match vulkan_decoder(entry, &info) {
+        Ok(d) => match check {
+            // `verifying` gives the claim back itself when it fails
+            Some(key) => HybridDecoder::verifying(d, entry.clone(), info, key).map_err(|e| e.to_string()),
+            None => Ok(HybridDecoder::new(d, entry.clone(), info)),
+        },
         Err(why) => {
             if let Some(key) = check {
                 hybrid::release(key);
             }
-            log::info!("hardware decoding declined for H.264 video: {why}");
+            Err(why)
+        }
+    };
+    match made {
+        Ok(h) => Some(Ok(Box::new(h))),
+        Err(why) => {
+            log::info!("hardware decoding declined for {} video: {why}", entry.codec.name());
             filmcraft_codecs::hw::note_hw_declined();
             None
         }
     }
 }
 
-/// The first-use verification key of the Vulkan Video H.264 path ([`hybrid::verification`]).
+/// The first-use verification keys of the Vulkan Video paths ([`hybrid::verification`],
+/// [`vulkan_verification_key`]).
 #[cfg(target_os = "linux")]
 pub const VULKAN_H264: &str = "Vulkan Video H.264";
+#[cfg(target_os = "linux")]
+pub const VULKAN_H264_MATRICES: &str = "Vulkan Video H.264 with scaling matrices";
+#[cfg(target_os = "linux")]
+pub const VULKAN_HEVC: &str = "Vulkan Video HEVC";
+#[cfg(target_os = "linux")]
+pub const VULKAN_HEVC_LISTS: &str = "Vulkan Video HEVC with scaling lists";
+#[cfg(target_os = "linux")]
+pub const VULKAN_HEVC_10: &str = "Vulkan Video HEVC 10-bit";
+#[cfg(target_os = "linux")]
+pub const VULKAN_HEVC_10_LISTS: &str = "Vulkan Video HEVC 10-bit with scaling lists";
